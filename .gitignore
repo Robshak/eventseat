@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+*.db
+*.db-*
+build/
+dist/
+*.spec
+.qa/
+*.log
+.uv-cache/
