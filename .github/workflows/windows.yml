@@ -6,6 +6,7 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -19,6 +20,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: EventSeat-Windows-x64
+          if-no-files-found: error
           path: |
             dist/release/EventSeat.exe
             dist/release/SHA256SUMS.txt

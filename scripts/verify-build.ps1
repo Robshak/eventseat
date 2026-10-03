@@ -13,6 +13,9 @@ try {
             Stop-Process -Id $verification.Id -Force
             throw "Превышено время проверки $phase."
         }
+        if ($verification.ExitCode -ne 0) {
+            throw "Проверка $phase завершилась с кодом $($verification.ExitCode)."
+        }
         $report = Get-Content -LiteralPath (Join-Path $runFolder "report-$phase.json") -Raw | ConvertFrom-Json
         if (-not $report.success) { throw $report.error }
         Write-Output ("Проверка {0}: успешно, проверок {1}." -f $phase, $report.checks.Count)
