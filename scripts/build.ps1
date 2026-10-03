@@ -12,5 +12,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Тесты не пройдены." }
     & $Uv run --frozen flet pack main.py --name EventSeat --icon assets/eventseat.ico --add-data "assets:assets" --product-name EventSeat --product-version 1.0.0 --file-version 1.0.0.0 --file-description EventSeat --distpath dist/release --yes
     if ($LASTEXITCODE -ne 0) { throw "Ошибка сборки." }
-    Get-FileHash dist/release/EventSeat.exe -Algorithm SHA256 | Format-List
+    $digest = Get-FileHash dist/release/EventSeat.exe -Algorithm SHA256
+    ($digest.Hash.ToLower() + "  EventSeat.exe") | Set-Content dist/release/SHA256SUMS.txt -Encoding ascii
+    $digest | Format-List
 } finally { Pop-Location }

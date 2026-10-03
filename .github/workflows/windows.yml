@@ -6,13 +6,48 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv python install 3.13
       - run: ./scripts/build.ps1
         shell: pwsh
+      - run: ./scripts/verify-build.ps1
+        shell: pwsh
       - uses: actions/upload-artifact@v4
         with:
           name: EventSeat-Windows-x64
-          path: dist/release/EventSeat.exe
+          path: |
+            dist/release/EventSeat.exe
+            dist/release/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: EventSeat-verification
+          include-hidden-files: true
+          path: |
+            .qa/release-*/report-*.json
+            .qa/release-*/*.png
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: EventSeat-Windows-x64
+          path: release
+      - name: Publish version once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v1.0.0 >/dev/null 2>&1; then
+            echo "Release v1.0.0 already exists; keeping its artifacts unchanged."
+          else
+            gh release create v1.0.0 release/EventSeat.exe release/SHA256SUMS.txt --target "$GITHUB_SHA" --title "EventSeat 1.0.0 — Windows x64" --notes-file docs/RELEASE_NOTES.md
+          fi
