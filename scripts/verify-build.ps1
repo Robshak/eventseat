@@ -9,7 +9,7 @@ try {
     $env:EVENTSEAT_QA_PASSWORD = [Guid]::NewGuid().ToString('N')
     foreach ($phase in @("create", "resume")) {
         $verification = Start-Process -FilePath $binary -ArgumentList @('--verify-ui', ('"' + $runFolder + '"'), '--phase', $phase) -WindowStyle Hidden -PassThru
-        if (-not $verification.WaitForExit(120000)) {
+        if (-not $verification.WaitForExit(300000)) {
             Stop-Process -Id $verification.Id -Force
             throw "Превышено время проверки $phase."
         }

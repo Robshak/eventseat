@@ -1,4 +1,7 @@
-param([string]$Uv = "uv")
+param(
+    [string]$Uv = "uv",
+    [string]$OutputDirectory = "dist/release"
+)
 $ErrorActionPreference = "Stop"
 Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
@@ -12,9 +15,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Тесты не пройдены." }
     $version = & $Uv run --frozen python -c 'from eventseat import __version__; print(__version__)'
     if ($LASTEXITCODE -ne 0) { throw "Не удалось определить версию приложения." }
-    & $Uv run --frozen flet pack main.py --name EventSeat --icon assets/eventseat.ico --add-data "assets:assets" --product-name EventSeat --product-version $version --file-version "$version.0" --file-description EventSeat --distpath dist/release --yes
+    & $Uv run --frozen flet pack main.py --name EventSeat --icon assets/eventseat.ico --add-data "assets:assets" --product-name EventSeat --product-version $version --file-version "$version.0" --file-description EventSeat --distpath $OutputDirectory --yes
     if ($LASTEXITCODE -ne 0) { throw "Ошибка сборки." }
-    $digest = Get-FileHash dist/release/EventSeat.exe -Algorithm SHA256
-    ($digest.Hash.ToLower() + "  EventSeat.exe") | Set-Content dist/release/SHA256SUMS.txt -Encoding ascii
+    $executablePath = Join-Path $OutputDirectory "EventSeat.exe"
+    $checksumPath = Join-Path $OutputDirectory "SHA256SUMS.txt"
+    $digest = Get-FileHash -LiteralPath $executablePath -Algorithm SHA256
+    ($digest.Hash.ToLower() + "  EventSeat.exe") | Set-Content -LiteralPath $checksumPath -Encoding ascii
     $digest | Format-List
 } finally { Pop-Location }

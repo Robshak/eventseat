@@ -29,7 +29,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 from eventseat.domain import AppError
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class Base(DeclarativeBase):
@@ -163,6 +163,10 @@ class BookingRecord(Base):
     session_id: Mapped[int] = mapped_column(ForeignKey("event_sessions.id", ondelete="RESTRICT"))
     title: Mapped[str] = mapped_column(String(160))
     hall_name: Mapped[str] = mapped_column(String(100))
+    hall_id: Mapped[int | None] = mapped_column(ForeignKey("halls.id", ondelete="RESTRICT"))
+    stage: Mapped[str] = mapped_column(String(100), default="СЦЕНА")
+    layout: Mapped[list] = mapped_column(JSON, default=list)
+    layout_is_partial: Mapped[bool] = mapped_column(Boolean, default=False)
     start: Mapped[datetime] = mapped_column(DateTime)
     duration: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(15), default="active")
@@ -333,6 +337,9 @@ class Store:
                             (stage, json.dumps(layout), session_id),
                         )
                     connection.exec_driver_sql("PRAGMA user_version = 3")
+                if version < 4:
+                    self._migrate_booking_layouts(connection)
+                    connection.exec_driver_sql("PRAGMA user_version = 4")
                 if fresh and self._seed_new:
                     connection.exec_driver_sql(
                         "INSERT INTO settings (key, value) VALUES ('demo_pending', '1')"
@@ -342,6 +349,76 @@ class Store:
             except BaseException:
                 connection.rollback()
                 raise
+
+    @staticmethod
+    def _migrate_booking_layouts(connection) -> None:
+        columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(bookings)")}
+        additions = {
+            "hall_id": "INTEGER REFERENCES halls(id)",
+            "stage": "TEXT NOT NULL DEFAULT 'СЦЕНА'",
+            "layout": "JSON NOT NULL DEFAULT '[]'",
+            "layout_is_partial": "BOOLEAN NOT NULL DEFAULT 0",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.exec_driver_sql(f"ALTER TABLE bookings ADD COLUMN {name} {definition}")
+        bookings = connection.exec_driver_sql(
+            "SELECT id, session_id FROM bookings WHERE layout = '[]'"
+        ).all()
+        for booking_id, session_id in bookings:
+            session_hall, stage, raw_layout = connection.exec_driver_sql(
+                "SELECT hall_id, stage, layout FROM event_sessions WHERE id = ?", (session_id,)
+            ).one()
+            tickets = connection.exec_driver_sql(
+                "SELECT t.seat_id, t.row, t.number, t.category, s.hall_id "
+                "FROM tickets t JOIN seats s ON s.id = t.seat_id "
+                "WHERE t.booking_id = ? ORDER BY t.row, t.number",
+                (booking_id,),
+            ).all()
+            seats = {
+                seat_id: (row, number, category)
+                for seat_id, row, number, category in connection.exec_driver_sql(
+                    "SELECT seat_id, row, number, category FROM session_seats "
+                    "WHERE session_id = ? AND in_layout = 1",
+                    (session_id,),
+                )
+            }
+            hall_id = tickets[0][4] if tickets else session_hall
+            complete = bool(tickets) and all(
+                original_hall == session_hall
+                and seat_id in seats
+                and seats[seat_id][:2] == (row, number)
+                for seat_id, row, number, _, original_hall in tickets
+            )
+            if complete:
+                positions = {
+                    (row, number): (seat_id, category)
+                    for seat_id, (row, number, category) in seats.items()
+                }
+                layout = json.loads(raw_layout)
+                for cell in layout:
+                    seat = positions.get((cell["row"], cell["number"]))
+                    if seat:
+                        cell["seat_id"], cell["category"] = seat
+            else:
+                # Version 3 did not retain the original full grid after a hall change.
+                # Only ticket positions are certain; never present the new hall as history.
+                stage = "Сцена: положение не сохранено"
+                layout = [
+                    {
+                        "seat_id": seat_id,
+                        "row": row,
+                        "number": number,
+                        "category": category,
+                        "enabled": True,
+                    }
+                    for seat_id, row, number, category, _ in tickets
+                ]
+            connection.exec_driver_sql(
+                "UPDATE bookings SET hall_id = ?, stage = ?, layout = ?, "
+                "layout_is_partial = ? WHERE id = ?",
+                (hall_id, stage, json.dumps(layout), not complete, booking_id),
+            )
 
     @contextmanager
     def read(self) -> Iterator[Session]:

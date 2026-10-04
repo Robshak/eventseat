@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from collections import defaultdict
@@ -14,6 +15,7 @@ from eventseat import __version__
 from eventseat.account_sessions import AccountSessions
 from eventseat.config import asset_path
 from eventseat.domain import AppError, PriceChanged
+from eventseat.view_state import AccountViewState, ViewStates
 
 BG = "#F4F6F8"
 WHITE = "#FFFFFF"
@@ -114,6 +116,12 @@ def hoverable(control, background=None):
     """Highlight interactive surfaces without changing a seat's status colour."""
     normal_background = control.bgcolor
     normal_border = control.border or ft.Border.all(1, "#00000000")
+    hover_border = ft.Border(
+        top=ft.BorderSide(normal_border.top.width, TEAL),
+        right=ft.BorderSide(normal_border.right.width, TEAL),
+        bottom=ft.BorderSide(normal_border.bottom.width, TEAL),
+        left=ft.BorderSide(normal_border.left.width, TEAL),
+    )
     control.border = normal_border
     control.ink = True
     control.ink_color = "#18087F8C"
@@ -121,7 +129,7 @@ def hoverable(control, background=None):
 
     def hover(event):
         active = str(event.data).lower() == "true"
-        control.border = ft.Border.all(2, TEAL) if active else normal_border
+        control.border = hover_border if active else normal_border
         if background is not None:
             control.bgcolor = background if active else normal_background
         control.update()
@@ -135,6 +143,12 @@ class App:
         self.page = page
         self.accounts = AccountSessions(service)
         self._account_generation = 0
+        self._view_generation = 0
+        self._view_states = ViewStates()
+        self._capture = None
+        self._capture_user_id = None
+        self._route = {}
+        self.on_view_blur = None
         self.section = "Афиша"
         self.checkout_key = str(uuid4())
         self.busy_checkout = False
@@ -147,7 +161,51 @@ class App:
     def service(self):
         return self.accounts.current
 
+    @property
+    def view_state(self):
+        user = self.service.current_user
+        return self._view_states.for_account(user["id"] if user else 0)
+
+    def capture_view(self):
+        user = self.service.current_user
+        if self._capture and user and user["id"] == self._capture_user_id:
+            self._capture()
+
+    def clear_capture(self):
+        self._capture = None
+        self._capture_user_id = None
+
+    def set_view(self, route, capture=None):
+        self.capture_view()
+        if self.on_view_blur:
+            self.on_view_blur()
+        self.on_view_blur = None
+        self._capture = capture
+        self._capture_user_id = self.service.current_user["id"]
+        self._view_generation += 1
+        self._route = dict(route)
+        section = route["section"]
+        changed_section = self.section != section
+        self.section = section
+        self.view_state.section = section
+        self.view_state.routes[section] = dict(route)
+        key = AccountViewState.route_key(route)
+        state = self.view_state
+        self.content.on_scroll = lambda event: state.scroll_offsets.__setitem__(
+            key, max(0, event.pixels)
+        )
+        if changed_section:
+            self.shell()
+
+    async def _restore_scroll(self, generation, offset):
+        await asyncio.sleep(0.06)
+        if generation == self._view_generation and self.content.page:
+            await self.content.scroll_to(offset=offset, duration=0)
+
     def close(self):
+        self._view_generation += 1
+        self.clear_capture()
+        self._view_states.clear()
         self.accounts.close()
 
     def start(self):
@@ -182,6 +240,13 @@ class App:
         self.page.window.height = 850
         self.page.window.min_width = 1000
         self.page.window.min_height = 720
+
+        def window_event(event):
+            if event.type in (ft.WindowEventType.BLUR, ft.WindowEventType.HIDE):
+                if self.on_view_blur:
+                    self.on_view_blur()
+
+        self.page.window.on_event = window_event
         self.auth("setup" if self.service.needs_setup() else "login")
 
     def safe(self, action):
@@ -301,6 +366,44 @@ class App:
     def show(self, *controls):
         self.content.controls = list(controls)
         self.page.update()
+        if self.service.current_user and not self._route.get("focus_session_id"):
+            offset = self.view_state.scroll_offsets.get(AccountViewState.route_key(self._route), 0)
+            self.page.run_task(self._restore_scroll, self._view_generation, offset)
+
+    def date_field(self, label, value="", width=200):
+        target = field(label, value, width=width)
+
+        def calendar(_):
+            try:
+                selected = datetime.strptime(target.value, "%d.%m.%Y") if target.value else None
+            except ValueError:
+                selected = None
+
+            def changed(event):
+                if event.control.value:
+                    target.value = event.control.value.strftime("%d.%m.%Y")
+                    target.update()
+
+            self.page.show_dialog(
+                ft.DatePicker(
+                    value=selected,
+                    first_date=datetime(2000, 1, 1),
+                    last_date=datetime(2100, 12, 31),
+                    on_change=self.safe(changed),
+                    help_text=label,
+                    cancel_text="Отмена",
+                    confirm_text="Выбрать",
+                    field_label_text="Дата",
+                    field_hint_text="ДД.ММ.ГГГГ",
+                )
+            )
+
+        target.suffix_icon = ft.IconButton(
+            icon=ft.Icons.CALENDAR_MONTH_OUTLINED,
+            tooltip="Выбрать дату: " + label,
+            on_click=self.safe(calendar),
+        )
+        return target
 
     def auth(self, mode="login"):
         if self.service.current_user is not None:
@@ -446,40 +549,97 @@ class App:
                     border_radius=10,
                     bgcolor="#28475D" if label == self.section else NAVY,
                     on_click=self.safe(
-                        lambda _, action=action, label=label: self.navigate(label, action)
+                        lambda _, label=label: self.navigate(
+                            label, lambda: self.restore_section(label)
+                        )
                     ),
                 ),
                 background="#35566D",
             )
             for label, icon, action in entries
         ]
-        account_selector = ft.Dropdown(
-            label="Аккаунты",
-            value=str(user["id"]),
-            options=[
-                ft.DropdownOption(
-                    key=str(account["id"]),
-                    text=f"@{account['login']} · {account['name']}",
-                    tooltip=f"{account['name']} · @{account['login']}"
-                    + (" · Администратор" if account["role"] == "admin" else " · Пользователь"),
+        account_selector = ft.PopupMenuButton(
+            content=ft.Container(
+                ft.Column(
+                    [
+                        text("Аккаунты", 11, "#B9CAD8"),
+                        ft.Row(
+                            [
+                                text(
+                                    "@" + user["login"],
+                                    13,
+                                    WHITE,
+                                    True,
+                                    expand=True,
+                                    max_lines=1,
+                                    overflow=ft.TextOverflow.ELLIPSIS,
+                                ),
+                                ft.Icon(ft.Icons.UNFOLD_MORE, color="#91DAD3", size=19),
+                            ]
+                        ),
+                    ],
+                    spacing=5,
+                ),
+                bgcolor="#203B53",
+                border=ft.Border.all(1, "#66869D"),
+                border_radius=10,
+                padding=12,
+            ),
+            items=[
+                ft.PopupMenuItem(
+                    content=ft.Row(
+                        [
+                            ft.Icon(
+                                ft.Icons.CHECK_CIRCLE_OUTLINE
+                                if account["id"] == user["id"]
+                                else ft.Icons.PERSON_OUTLINE,
+                                color="#91DAD3",
+                                size=22,
+                            ),
+                            ft.Column(
+                                [
+                                    text(
+                                        account["name"],
+                                        14,
+                                        WHITE,
+                                        True,
+                                        max_lines=1,
+                                        overflow=ft.TextOverflow.ELLIPSIS,
+                                    ),
+                                    text(
+                                        "@"
+                                        + account["login"]
+                                        + (
+                                            " · Администратор"
+                                            if account["role"] == "admin"
+                                            else " · Пользователь"
+                                        ),
+                                        12,
+                                        "#C7D8E4",
+                                        max_lines=1,
+                                        overflow=ft.TextOverflow.ELLIPSIS,
+                                    ),
+                                ],
+                                spacing=3,
+                                expand=True,
+                            ),
+                        ],
+                        spacing=12,
+                    ),
+                    height=68,
+                    padding=12,
+                    data={"account_id": account["id"]},
+                    on_click=self.safe(lambda _, uid=account["id"]: self.switch_account(uid)),
                 )
                 for account in self.accounts.users
             ],
-            filled=True,
-            fill_color="#203B53",
             bgcolor=NAVY,
-            color=WHITE,
-            label_style=ft.TextStyle(color="#B9CAD8", size=12),
-            text_size=12,
-            border_color="#476377",
-            focused_border_color="#58D2C6",
-            menu_width=360,
-            menu_height=280,
-            tooltip=f"{user['name']} · @{user['login']}"
-            + (" · Администратор" if user["role"] == "admin" else " · Пользователь"),
-        )
-        account_selector.on_select = self.safe(
-            lambda _: self.switch_account(int(account_selector.value))
+            padding=0,
+            menu_padding=6,
+            shape=ft.RoundedRectangleBorder(radius=12, side=ft.BorderSide(1, "#66869D")),
+            size_constraints=ft.BoxConstraints(min_width=300, max_width=380, max_height=400),
+            tooltip="Переключить аккаунт",
+            data="account-switcher",
         )
         sidebar = ft.Container(
             ft.Column(
@@ -536,24 +696,35 @@ class App:
         self.page.update()
 
     def navigate(self, label, action):
+        self.capture_view()
+        self.clear_capture()
         self.section = label
         self.shell()
         action()
 
     def logout(self):
+        user_id = self.service.current_user["id"]
+        self.clear_capture()
+        self._view_states.forget(user_id)
         self.accounts.logout()
         self.reset_account_view()
         if self.service.current_user:
             self.shell()
-            self.catalogue()
+            self.restore_section(self.view_state.section)
         else:
             self.auth()
 
     def reset_account_view(self):
+        self.clear_capture()
+        if self.on_view_blur:
+            self.on_view_blur()
+        self.on_view_blur = None
+        self._view_generation += 1
         self._account_generation += 1
         while self.page.pop_dialog() is not None:
             pass
         self.section = "Афиша"
+        self._route = {}
         self.content.controls = []
         self.checkout_key = str(uuid4())
         self.busy_checkout = False
@@ -561,9 +732,11 @@ class App:
     def activate_account(self):
         self.reset_account_view()
         self.shell()
-        self.catalogue()
+        self.restore_section(self.view_state.section)
 
     def add_account(self):
+        self.capture_view()
+        self.clear_capture()
         self.accounts.begin_login()
         self.reset_account_view()
         self.auth()
@@ -573,8 +746,32 @@ class App:
         self.activate_account()
 
     def switch_account(self, user_id):
+        self.capture_view()
+        self.clear_capture()
         self.accounts.switch(user_id)
         self.activate_account()
+
+    def restore_section(self, section):
+        route = self.view_state.routes.get(section, {})
+        if section == "Администрирование":
+            self.admin()
+        elif section == "Профиль":
+            self.profile()
+        elif section == "Корзина":
+            self.cart()
+        elif section == "Мои бронирования":
+            if route.get("page") == "booking_map":
+                self.booking_map(route["booking_id"])
+            else:
+                self.bookings()
+        elif route.get("page") == "seats":
+            self.seats(route["session_id"], route.get("admin", False))
+        elif route.get("page") == "event":
+            self.event_detail(route["event_id"], route.get("related", False))
+        elif route.get("page") == "session":
+            self.session_detail(route["session_id"], route.get("related", False))
+        else:
+            self.catalogue()
 
     def cover(self, cover_path, width=270, height=174):
         fallback = ft.Container(
@@ -603,16 +800,37 @@ class App:
             border_radius=12,
         )
 
-    def catalogue(self, search="", category="", date_from="", date_to=""):
-        search_field = field("Найти событие", search, prefix_icon=ft.Icons.SEARCH, width=230)
-        category_field = select(
-            "Категория", [("", "Все категории"), *CATEGORIES], category, width=165
+    def catalogue(self, search=None, category="", date_from="", date_to=""):
+        self.capture_view()
+        restoring = search is None
+        applied = (
+            self.view_state.drafts.get("catalogue:applied", {})
+            if restoring
+            else {
+                "search": search,
+                "category": category,
+                "date_from": date_from,
+                "date_to": date_to,
+            }
         )
-        from_field = field("С · ДД.ММ.ГГГГ", date_from, width=200)
-        to_field = field("По · ДД.ММ.ГГГГ", date_to, width=200)
+        search = applied.get("search", "")
+        category = applied.get("category", "")
+        date_from, date_to = applied.get("date_from", ""), applied.get("date_to", "")
+        values = self.view_state.drafts.get("catalogue:fields", applied) if restoring else applied
+        search_field = field(
+            "Найти событие", values.get("search", ""), prefix_icon=ft.Icons.SEARCH, width=230
+        )
+        category_field = select(
+            "Категория", [("", "Все категории"), *CATEGORIES], values.get("category", ""), width=165
+        )
+        from_field = field("С · ДД.ММ.ГГГГ", values.get("date_from", ""), width=200)
+        to_field = field("По · ДД.ММ.ГГГГ", values.get("date_to", ""), width=200)
 
         def calendar(target, label):
-            selected = datetime.strptime(target.value, "%d.%m.%Y") if target.value else None
+            try:
+                selected = datetime.strptime(target.value, "%d.%m.%Y") if target.value else None
+            except ValueError:
+                selected = None
 
             def changed(event):
                 if event.control.value:
@@ -662,6 +880,18 @@ class App:
             date_from=datetime.strptime(date_from, "%d.%m.%Y").date() if date_from else None,
             date_to=datetime.strptime(date_to, "%d.%m.%Y").date() if date_to else None,
         )
+
+        def capture():
+            self.view_state.drafts["catalogue:fields"] = {
+                "search": search_field.value,
+                "category": category_field.value,
+                "date_from": from_field.value,
+                "date_to": to_field.value,
+            }
+
+        self.set_view({"section": "Афиша", "page": "catalogue", **applied}, capture=capture)
+        self.view_state.drafts["catalogue:applied"] = dict(applied)
+        capture()
         cards = []
         for event in events:
             cards.append(
@@ -712,7 +942,7 @@ class App:
                                 eid,
                                 back=(
                                     "К афише",
-                                    lambda: self.catalogue(search, category, date_from, date_to),
+                                    self.catalogue,
                                 ),
                             )
                         ),
@@ -757,7 +987,7 @@ class App:
                 [
                     text(f"Событий: {len(events)}", 15, bold=True),
                     ft.TextButton(
-                        "Сбросить фильтры", on_click=self.safe(lambda _: self.catalogue())
+                        "Сбросить фильтры", on_click=self.safe(lambda _: self.catalogue(""))
                     ),
                 ]
             ),
@@ -767,6 +997,9 @@ class App:
         )
 
     def event_detail(self, event_id, related=False, back=None):
+        self.set_view(
+            {"section": "Афиша", "page": "event", "event_id": event_id, "related": related}
+        )
         event = (
             self.service.get_related_event(event_id)
             if related
@@ -844,22 +1077,43 @@ class App:
         self.show(*controls)
 
     def seats(self, session_id, admin=False):
+        self.capture_view()
         is_admin = self.service.current_user["role"] == "admin"
         if admin and not is_admin:
             raise AppError("Управление местами доступно только администратору.")
         preview = is_admin and not admin
         session = self.service.get_session(session_id)
         seats = self.service.seat_map(session_id)
-        selected = set()
+        draft_key = f"seat-selection:{session_id}"
+        draft = self.view_state.drafts.get(draft_key, {}) if not admin and not preview else {}
+        available = {seat["id"] for seat in seats if seat["status"] == "free"}
+        selected = set(draft.get("selected", [])) & available
         tariff = select(
             "Тариф",
             [("standard", "Обычный"), ("concession", "Учебный льготный · −20%")],
-            "standard",
+            draft.get("tariff", "standard"),
             width=275,
         )
         selection = ft.Column(spacing=10)
         total = text("0,00 ₽", 27, bold=True)
         cells = {}
+
+        def capture():
+            if not admin and not preview:
+                self.view_state.drafts[draft_key] = {
+                    "selected": sorted(selected),
+                    "tariff": tariff.value,
+                }
+
+        self.set_view(
+            {
+                "section": "Администрирование" if admin else "Афиша",
+                "page": "seats",
+                "session_id": session_id,
+                "admin": admin,
+            },
+            capture=capture,
+        )
 
         def price(seat):
             from eventseat.domain import calculate_ticket_price
@@ -934,6 +1188,9 @@ class App:
             if not selected:
                 raise AppError("Выберите хотя бы одно место.")
             self.service.add_to_cart(session_id, sorted(selected), tariff.value)
+            selected.clear()
+            self.view_state.drafts.pop(draft_key, None)
+            self.clear_capture()
             self.checkout_key = str(uuid4())
             self.navigate("Корзина", self.cart)
             self.notice("Места добавлены в корзину. Подтвердите бронирование, чтобы закрепить их.")
@@ -1004,7 +1261,7 @@ class App:
                     ),
                     self.button(
                         "Управление сеансами",
-                        lambda _: self.navigate("Администрирование", lambda: self.admin("Сеансы")),
+                        lambda _: self.admin("Сеансы", focus_session_id=session_id),
                         secondary=True,
                     ),
                 ]
@@ -1050,6 +1307,7 @@ class App:
         if self.service.current_user["role"] == "admin":
             self.navigate("Афиша", self.catalogue)
             return
+        self.set_view({"section": "Корзина", "page": "cart"})
         items = self.service.get_cart()
         groups = defaultdict(list)
         for item in items:
@@ -1176,6 +1434,14 @@ class App:
 
     def bookings(self, admin=False, search=""):
         admin = admin or self.service.current_user["role"] == "admin"
+        self.set_view(
+            {
+                "section": "Администрирование" if admin else "Мои бронирования",
+                "page": "list" if admin else "bookings",
+                "tab": "Бронирования",
+                "search": search,
+            }
+        )
         bookings = self.service.list_bookings(search=search, admin=admin)
         controls = [
             self.heading(
@@ -1216,6 +1482,17 @@ class App:
                 self.button(
                     "Электронный билет",
                     lambda _, bid=booking["id"]: self.ticket(bid),
+                    secondary=True,
+                ),
+                self.button(
+                    "Места на схеме",
+                    lambda _, bid=booking["id"]: self.booking_map(bid),
+                    icon=ft.Icons.EVENT_SEAT_OUTLINED,
+                    secondary=True,
+                ),
+                self.button(
+                    "К сеансу",
+                    lambda _, sid=booking["session_id"]: self.session_detail(sid, related=True),
                     secondary=True,
                 ),
             ]
@@ -1321,19 +1598,222 @@ class App:
                     else []
                 ),
             ],
+            actions=[
+                self.button(
+                    "Места на схеме",
+                    lambda _: self.open_ticket_target(lambda: self.booking_map(booking_id)),
+                    secondary=True,
+                ),
+                self.button(
+                    "К сеансу",
+                    lambda _: self.open_ticket_target(
+                        lambda: self.session_detail(booking["session_id"], related=True)
+                    ),
+                    secondary=True,
+                ),
+                self.button("Закрыть", lambda _: self.page.pop_dialog(), secondary=True),
+            ],
         )
 
+    def open_ticket_target(self, action):
+        self.page.pop_dialog()
+        action()
+
+    def readonly_map(self, layout, stage, selected_label="Места в билете"):
+        rows = defaultdict(list)
+        for position in layout:
+            rows[position["row"]].append(position)
+        grid = []
+        for row, positions in sorted(rows.items()):
+            cells = [ft.Container(text(f"Ряд {row}", 11, MUTED), width=58)]
+            for position in sorted(positions, key=lambda item: item["number"]):
+                selected = position.get("selected", False)
+                if not position.get("enabled", True):
+                    cells.append(ft.Container(width=38, height=36))
+                    continue
+                cells.append(
+                    ft.Container(
+                        text(position["number"], 12, WHITE if selected else INK, bold=True),
+                        width=38,
+                        height=36,
+                        border_radius=9,
+                        alignment=ft.Alignment.CENTER,
+                        bgcolor=TEAL if selected else "#E1E7EC",
+                        border=ft.Border.all(1, TEAL if selected else "#CFD8E0"),
+                        tooltip=f"Ряд {row}, место {position['number']}"
+                        + (" · " + selected_label if selected else ""),
+                        data={"seat_position": [row, position["number"]], "selected": selected},
+                    )
+                )
+            grid.append(ft.Row(cells, spacing=7))
+        return panel(
+            ft.Container(
+                text(stage or "СЦЕНА / ЭКРАН", 12, MUTED, True),
+                height=36,
+                bgcolor=BG,
+                border_radius=8,
+                alignment=ft.Alignment.CENTER,
+            ),
+            ft.Row([ft.Column(grid, spacing=9)], scroll=ft.ScrollMode.ALWAYS),
+            ft.Row(
+                [
+                    ft.Container(width=16, height=16, bgcolor=TEAL, border_radius=4),
+                    text(selected_label, 13, MUTED),
+                ],
+                tight=True,
+            ),
+        )
+
+    def booking_map(self, booking_id):
+        result = self.service.get_booking_seat_map(booking_id)
+        booking = result["booking"]
+        admin = self.service.current_user["role"] == "admin"
+        self.set_view(
+            {
+                "section": "Администрирование" if admin else "Мои бронирования",
+                "page": "booking_map",
+                "booking_id": booking_id,
+            }
+        )
+
+        def back():
+            self.admin("Бронирования") if admin else self.bookings()
+
+        controls = [
+            self.button(
+                "К бронированиям", lambda _: back(), icon=ft.Icons.ARROW_BACK, secondary=True
+            ),
+            self.heading("Места по билету", f"{booking['number']} · {booking['title']}"),
+            text(
+                f"{date_text(booking['start'])} · {booking['hall_name']} · сеанс #{booking['session_id']}",
+                17,
+                bold=True,
+            ),
+            tag(
+                {"active": "Активно", "cancelled": "Отменено", "completed": "Завершено"}[
+                    booking["status"]
+                ]
+            ),
+        ]
+        if result["layout_is_partial"]:
+            controls.append(
+                text(
+                    "Для этого старого билета полная схема не сохранилась. Показаны известные ряды и места билета.",
+                    color=MUTED,
+                )
+            )
+        if result["session_changed"]:
+            controls.append(
+                text(
+                    "После оформления сеанс был перенесён. Здесь показаны зал и места исходного билета; переход к сеансу откроет его актуальные сведения.",
+                    color=MUTED,
+                )
+            )
+        controls += [
+            self.readonly_map(result["layout"], result["stage"], "Места этого билета"),
+            text(
+                "Это схема на момент оформления. Отмена билета освобождает места; карта не показывает их текущую занятость.",
+                13,
+                MUTED,
+            ),
+            ft.Row(
+                [
+                    self.button(
+                        "К мероприятию",
+                        lambda _: self.event_detail(
+                            result["event_id"],
+                            related=True,
+                            back=("К схеме билета", lambda: self.booking_map(booking_id)),
+                        ),
+                        secondary=True,
+                    ),
+                    self.button(
+                        "К сеансу",
+                        lambda _: self.session_detail(
+                            result["session_id"],
+                            related=True,
+                            back=("К схеме билета", lambda: self.booking_map(booking_id)),
+                        ),
+                        secondary=True,
+                    ),
+                    self.button(
+                        "Электронный билет", lambda _: self.ticket(booking_id), secondary=True
+                    ),
+                ],
+                wrap=True,
+            ),
+        ]
+        self.show(*controls)
+
+    def session_detail(self, session_id, related=False, back=None):
+        if self.service.current_user["role"] == "admin":
+            from eventseat.ui_admin import AdminUI
+
+            AdminUI(self).session_detail(session_id)
+            return
+        session = (
+            self.service.get_related_session(session_id)
+            if related
+            else self.service.get_session(session_id)
+        )
+        self.set_view(
+            {"section": "Афиша", "page": "session", "session_id": session_id, "related": related}
+        )
+        cancelled = session["status"] == "cancelled"
+        future = session["start"] > datetime.now()
+        state = "Отменён" if cancelled else "Предстоящий" if future else "Завершён"
+        back_label, back_action = back or (
+            ("К бронированиям", self.bookings)
+            if related
+            else ("К мероприятию", lambda: self.event_detail(session["event_id"]))
+        )
+        controls = [
+            self.button(
+                back_label, lambda _: back_action(), secondary=True, icon=ft.Icons.ARROW_BACK
+            ),
+            self.heading(f"Сеанс #{session_id}", session["title"]),
+            panel(
+                text(date_text(session["start"]), 24, bold=True),
+                text(f"{session['hall_name']} · {session['duration']} минут", 18),
+                tag(state, RED if cancelled else TEAL),
+                *(
+                    [text("Причина отмены: " + session["cancel_reason"], color=RED)]
+                    if cancelled
+                    else []
+                ),
+            ),
+            self.button(
+                "К мероприятию",
+                lambda _: self.event_detail(session["event_id"], related=related),
+                secondary=True,
+            ),
+        ]
+        if session.get("bookable", not cancelled and future) and session["free_count"]:
+            controls.append(self.button("Выбрать места", lambda _: self.seats(session_id)))
+        else:
+            controls.append(text("Новые бронирования на этот сеанс недоступны.", color=MUTED))
+        self.show(*controls)
+
     def profile(self):
+        self.capture_view()
         user = self.service.current_user
-        name = field("Отображаемое имя", user["name"])
+        name = field(
+            "Отображаемое имя", self.view_state.drafts.get("profile", {}).get("name", user["name"])
+        )
         old = field("Текущий пароль", password=True, can_reveal_password=True)
         new = field("Новый пароль", password=True, can_reveal_password=True)
         repeat = field("Повторите новый пароль", password=True, can_reveal_password=True)
+        self.set_view(
+            {"section": "Профиль", "page": "profile"},
+            capture=lambda: self.view_state.drafts.__setitem__("profile", {"name": name.value}),
+        )
 
         def save(_):
             if new.value != repeat.value:
                 raise AppError("Новые пароли не совпадают.")
             self.service.update_profile(name.value, old.value, new.value)
+            self.clear_capture()
+            self.view_state.drafts.pop("profile", None)
             self.shell()
             self.profile()
             self.notice("Профиль сохранён.")
@@ -1368,7 +1848,35 @@ class App:
             ),
         )
 
-    def admin(self, tab="Мероприятия", search=""):
+    def admin(self, tab=None, search="", **kwargs):
         from eventseat.ui_admin import AdminUI
 
-        AdminUI(self).show(tab, search)
+        self.capture_view()
+        admin = AdminUI(self)
+        if tab is not None:
+            admin.show(tab, search, **kwargs)
+            return
+        route = self.view_state.admin_route
+        page = route.get("page", "list")
+        if page == "hall":
+            admin.hall_form(route.get("hall_id"))
+        elif page == "event_form":
+            admin.event_form(route.get("event_id"))
+        elif page == "session_form":
+            admin.session_form(route.get("session_id"), route.get("event_id"))
+        elif page == "session_detail":
+            admin.session_detail(route["session_id"])
+        elif page == "seats":
+            self.seats(route["session_id"], True)
+        elif page == "booking_map":
+            self.booking_map(route["booking_id"])
+        else:
+            admin.show(
+                route.get("tab", "Мероприятия"),
+                route.get("search", ""),
+                **{
+                    key: route[key]
+                    for key in ("event_id", "hall_id", "focus_session_id")
+                    if key in route
+                },
+            )

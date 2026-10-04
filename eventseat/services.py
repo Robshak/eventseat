@@ -672,14 +672,69 @@ class Service:
             "layout": [dict(cell) for cell in record.layout],
         }
 
-    def list_sessions(self, event_id=None, admin: bool = False) -> list[dict]:
+    def _session_filters(
+        self,
+        query,
+        *,
+        session_id=None,
+        event_id=None,
+        hall_id=None,
+        date_from=None,
+        date_to=None,
+        status="all",
+    ):
+        first, last = self._filter_date(date_from), self._filter_date(date_to)
+        if first is not None and last is not None and first > last:
+            raise AppError("Начало интервала не может быть позже его окончания.")
+        if status not in {"all", "upcoming", "completed", "cancelled"}:
+            raise AppError("Неизвестный статус сеанса.")
+        if session_id is not None:
+            query = query.where(SessionRecord.id == session_id)
+        if event_id is not None:
+            query = query.where(SessionRecord.event_id == event_id)
+        if hall_id is not None:
+            query = query.where(SessionRecord.hall_id == hall_id)
+        if first is not None:
+            query = query.where(func.date(SessionRecord.start) >= first.isoformat())
+        if last is not None:
+            query = query.where(func.date(SessionRecord.start) <= last.isoformat())
+        if status == "cancelled":
+            query = query.where(SessionRecord.status == "cancelled")
+        elif status in {"upcoming", "completed"}:
+            query = query.where(SessionRecord.status == "available")
+            query = query.where(
+                SessionRecord.start > self._now()
+                if status == "upcoming"
+                else SessionRecord.start <= self._now()
+            )
+        return query
+
+    def list_sessions(
+        self,
+        event_id=None,
+        admin: bool = False,
+        *,
+        hall_id=None,
+        date_from=None,
+        date_to=None,
+        status="all",
+    ) -> list[dict]:
         with self.store.read() as db:
             if admin:
                 self._actor(db, admin=True)
             query = select(SessionRecord).join(EventRecord).order_by(SessionRecord.start)
             if event_id is not None:
                 self._event_record(db, event_id)
-                query = query.where(SessionRecord.event_id == event_id)
+            if hall_id is not None:
+                self._hall_record(db, hall_id)
+            query = self._session_filters(
+                query,
+                event_id=event_id,
+                hall_id=hall_id,
+                date_from=date_from,
+                date_to=date_to,
+                status=status,
+            )
             if not admin:
                 query = query.where(
                     EventRecord.published.is_(True),
@@ -691,6 +746,40 @@ class Service:
     def get_session(self, session_id: int) -> dict:
         with self.store.read() as db:
             return self._session_dict(db, self._session_record(db, session_id))
+
+    def get_related_session(self, session_id: int) -> dict:
+        """Read a session linked to the actor's own cart or booking, including history."""
+        with self.store.read() as db:
+            actor = self._actor(db)
+            in_cart = db.scalar(
+                select(CartItemRecord.id)
+                .where(
+                    CartItemRecord.user_id == actor.id,
+                    CartItemRecord.session_id == session_id,
+                )
+                .limit(1)
+            )
+            in_history = db.scalar(
+                select(BookingRecord.id)
+                .where(
+                    BookingRecord.user_id == actor.id,
+                    BookingRecord.session_id == session_id,
+                )
+                .limit(1)
+            )
+            if actor.role != "admin" and in_cart is None and in_history is None:
+                raise AppError("Сеанс не связан с вашей корзиной или бронированиями.")
+            record = self._session_record(db, session_id, public=False)
+            result = self._session_dict(db, record)
+            event = self._event_record(db, record.event_id, public=False)
+            result["published"] = event.published
+            result["bookable"] = (
+                actor.role != "admin"
+                and event.published
+                and record.status == "available"
+                and record.start > self._now()
+            )
+            return result
 
     def cancel_session(self, session_id: int, reason: str) -> None:
         reason = required_text(reason, "Причина отмены", 1000)
@@ -974,6 +1063,10 @@ class Service:
                         session_id=session_id,
                         title=event.title,
                         hall_name=hall.name,
+                        hall_id=hall.id,
+                        stage=session.stage,
+                        layout=self._booking_layout(db, session),
+                        layout_is_partial=False,
                         start=session.start,
                         duration=session.duration,
                         total=cart.total,
@@ -1020,6 +1113,15 @@ class Service:
                 .order_by(TicketRecord.row, TicketRecord.number)
             )
         )
+
+    def _booking_layout(self, db, session: SessionRecord) -> list[dict]:
+        positions = {(seat.row, seat.number): seat for seat in self._snapshot_seats(db, session.id)}
+        layout = [dict(cell) for cell in session.layout]
+        for cell in layout:
+            seat = positions.get((cell["row"], cell["number"]))
+            if seat is not None:
+                cell.update(seat_id=seat.seat_id, category=seat.category)
+        return layout
 
     def _booking_domain(self, db, record: BookingRecord) -> Booking:
         owner = self._user_domain(db.get(UserRecord, record.user_id))
@@ -1090,6 +1192,38 @@ class Service:
             actor.require_owner(record.user_id, allow_admin=True)
             return self._booking_dict(db, record)
 
+    def get_booking_seat_map(self, booking_id: int) -> dict:
+        """Return the immutable hall layout and purchased seats, visible only to its owner/admin."""
+        with self.store.read() as db:
+            actor = self._actor(db)
+            record = db.get(BookingRecord, booking_id)
+            if record is None:
+                raise AppError("Бронирование не найдено.")
+            actor.require_owner(record.user_id, allow_admin=True)
+            booking = self._booking_dict(db, record)
+            selected = {ticket["seat_id"] for ticket in booking["tickets"]}
+            layout = [
+                {**cell, "selected": cell.get("seat_id") in selected} for cell in record.layout
+            ]
+            session = self._session_record(db, record.session_id, public=False)
+            event = self._event_record(db, session.event_id, public=False)
+            return {
+                "booking": booking,
+                "session": self._session_dict(db, session),
+                "event_id": event.id,
+                "session_id": session.id,
+                "hall_id": record.hall_id,
+                "hall_name": record.hall_name,
+                "stage": record.stage,
+                "layout": layout,
+                "selected_seat_ids": sorted(selected),
+                "layout_is_partial": record.layout_is_partial,
+                "published": event.published,
+                "session_changed": (
+                    record.hall_id != session.hall_id or record.start != session.start
+                ),
+            }
+
     @staticmethod
     def _cancel_booking_record(db, record: BookingRecord, reason: str) -> None:
         record.status, record.cancel_reason = "cancelled", reason
@@ -1106,15 +1240,41 @@ class Service:
             if domain.cancel(actor, reason, self._now()):
                 self._cancel_booking_record(db, record, domain.cancel_reason)
 
-    def statistics(self, session_id=None) -> dict:
+    def statistics(
+        self,
+        session_id=None,
+        *,
+        event_id=None,
+        hall_id=None,
+        date_from=None,
+        date_to=None,
+        session_status="upcoming",
+        booking_status="valid",
+    ) -> dict:
+        """Aggregate selected sessions; dates refer to session starts, amounts are kopecks.
+
+        The booking filter affects booking_count/ticket_count/amount. Occupancy always
+        counts non-cancelled tickets, so refunded historical tickets cannot fill a hall.
+        """
         with self.store.read() as db:
             self._actor(db, admin=True)
-            session_query = select(SessionRecord.id).where(
-                SessionRecord.status == "available", SessionRecord.start > self._now()
-            )
+            if booking_status not in {"valid", "all", "active", "completed", "cancelled"}:
+                raise AppError("Неизвестный статус бронирования.")
             if session_id is not None:
                 self._session_record(db, session_id, public=False)
-                session_query = session_query.where(SessionRecord.id == session_id)
+            if event_id is not None:
+                self._event_record(db, event_id, public=False)
+            if hall_id is not None:
+                self._hall_record(db, hall_id)
+            session_query = self._session_filters(
+                select(SessionRecord.id),
+                session_id=session_id,
+                event_id=event_id,
+                hall_id=hall_id,
+                date_from=date_from,
+                date_to=date_to,
+                status=session_status,
+            )
             session_ids = list(db.scalars(session_query))
             total_seats = db.scalar(
                 select(func.count())
@@ -1124,13 +1284,32 @@ class Service:
                     SessionSeatRecord.in_layout.is_(True),
                 )
             )
-            tickets = list(
-                db.scalars(
-                    select(TicketRecord).where(
-                        TicketRecord.session_id.in_(session_ids), TicketRecord.active.is_(True)
-                    )
-                )
+            bookings = list(
+                db.scalars(select(BookingRecord).where(BookingRecord.session_id.in_(session_ids)))
             )
+            now = self._now()
+            statuses = {
+                record.id: (
+                    "cancelled"
+                    if record.status == "cancelled"
+                    else "completed"
+                    if record.start <= now
+                    else "active"
+                )
+                for record in bookings
+            }
+            matching = {
+                booking_id
+                for booking_id, status in statuses.items()
+                if booking_status == "all"
+                or (booking_status == "valid" and status != "cancelled")
+                or status == booking_status
+            }
+            all_tickets = list(
+                db.scalars(select(TicketRecord).where(TicketRecord.session_id.in_(session_ids)))
+            )
+            tickets = [ticket for ticket in all_tickets if ticket.active]
+            filtered = [ticket for ticket in all_tickets if ticket.booking_id in matching]
             return {
                 "active_tickets": len(tickets),
                 "occupancy_percent": round(len(tickets) / total_seats * 100, 1)
@@ -1138,6 +1317,11 @@ class Service:
                 else 0.0,
                 "active_amount": sum(t.price for t in tickets),
                 "total_seats": total_seats,
+                "session_count": len(session_ids),
+                "booking_count": len(matching),
+                "ticket_count": len(filtered),
+                "amount": sum(ticket.price for ticket in filtered),
+                "cancelled_tickets": sum(not ticket.active for ticket in all_tickets),
             }
 
     def _seed_demo(self) -> None:
