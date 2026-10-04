@@ -108,7 +108,6 @@ class Seat:
     row: int
     number: int
     category: str = "стандарт"
-    price_override: int | None = None
     enabled: bool = True
 
     def __post_init__(self) -> None:
@@ -118,15 +117,9 @@ class Seat:
             raise AppError("Номер ряда и места должен быть положительным целым числом.")
         if self.category not in SEAT_CATEGORIES:
             raise AppError("Неизвестная категория места.")
-        if self.price_override is not None:
-            money(self.price_override)
 
     def price(self, category_prices: dict[str, int]) -> int:
-        return (
-            self.price_override
-            if self.price_override is not None
-            else money(category_prices[self.category])
-        )
+        return money(category_prices[self.category])
 
     def __str__(self) -> str:
         return f"ряд {self.row}, место {self.number}"

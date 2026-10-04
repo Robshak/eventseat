@@ -1,3 +1,4 @@
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from threading import Barrier
@@ -103,11 +104,12 @@ def test_same_physical_seat_can_be_booked_for_different_sessions(system):
 
 
 def test_price_change_requires_second_confirmation_and_keeps_ticket_price(system):
-    admin, user, session = system["admin"], system["user"], system["session"]
+    user, session = system["user"], system["session"]
     user.add_to_cart(session, seat_ids(user, session)[:1])
     before = user.get_cart()[0]["price"]
-    new_prices = {category: amount + 5500 for category, amount in system["prices"].items()}
-    admin.set_session_prices(session, new_prices)
+    # Defensive compatibility with stale quotes left by a legacy writer/import.
+    with sqlite3.connect(system["database"]) as db:
+        db.execute("UPDATE session_seats SET price = price + 5500 WHERE session_id = ?", (session,))
     with pytest.raises(PriceChanged):
         user.checkout("old-price")
     assert user.list_bookings() == []
@@ -118,15 +120,19 @@ def test_price_change_requires_second_confirmation_and_keeps_ticket_price(system
     assert user.list_bookings() == []
     booking = user.checkout("accepted-price")[0]
     assert booking["total"] == new_price
-    admin.set_session_prices(session, {category: 99900 for category in system["prices"]})
+    with sqlite3.connect(system["database"]) as db:
+        db.execute("UPDATE session_seats SET price = 99900 WHERE session_id = ?", (session,))
     persisted = user.get_booking(booking["id"])
     assert persisted["total"] == new_price
     assert persisted["tickets"][0]["price"] == new_price
 
 
 def test_concession_tariff_is_twenty_percent_and_precise(system):
-    admin, user, session = system["admin"], system["user"], system["session"]
-    admin.set_session_prices(session, {category: 12345 for category in system["prices"]})
+    admin, user = system["admin"], system["user"]
+    hall = admin.save_hall(
+        "Зал со скидками", 1, 2, "Сцена", {category: 12345 for category in system["prices"]}
+    )
+    session = admin.save_session(system["event"], hall, system["start"])
     user.add_to_cart(session, seat_ids(user, session)[:1], tariff="concession")
     assert user.get_cart()[0]["price"] == 9876
     booking = user.checkout("educational-discount")[0]
@@ -208,9 +214,10 @@ def test_seat_from_another_hall_cannot_be_added_to_session(system):
 
 
 def test_changed_price_old_key_remains_invalid_after_restart(system):
-    admin, user, session = system["admin"], system["user"], system["session"]
+    user, session = system["user"], system["session"]
     user.add_to_cart(session, seat_ids(user, session)[:1])
-    admin.set_session_prices(session, {category: 20000 for category in system["prices"]})
+    with sqlite3.connect(system["database"]) as db:
+        db.execute("UPDATE session_seats SET price = 20000 WHERE session_id = ?", (session,))
     with pytest.raises(PriceChanged):
         user.checkout("outdated-click")
     user.close()

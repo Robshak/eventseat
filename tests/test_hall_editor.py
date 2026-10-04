@@ -56,7 +56,6 @@ def make_admin():
                 "row": row,
                 "number": number,
                 "category": "стандарт",
-                "price_override": None,
                 "enabled": True,
             }
             for row in (3, 4)
@@ -85,8 +84,8 @@ def test_editor_restores_serializable_pending_fields_and_group_selection():
     editor.selection.click(editor.seats, 0)
     editor.selection.click(editor.seats, 4, shift=True)
     editor.draw_inspector()
-    editor.property_fields["price_mode"].value = "custom"
-    editor.property_fields["price"].value = "123,"
+    editor.prices["VIP"].value = "123,"
+    editor.property_fields["category"].value = "VIP"
     editor.capture()
     json.dumps(admin.app.view_state.drafts)
     restored = HallEditor(admin, 7)
@@ -94,8 +93,9 @@ def test_editor_restores_serializable_pending_fields_and_group_selection():
     assert restored.fields["name"].value == "Ещё не сохранённый зал"
     assert restored.fields["rows"].value == ""
     assert restored.selection.selected == {0, 1, 3, 4}
-    assert restored.property_fields["price"].value == "123,"
-    assert restored.property_fields["price"].visible is True
+    assert restored.prices["VIP"].value == "123,"
+    assert restored.property_fields["category"].value == "VIP"
+    assert set(restored.property_fields) == {"category", "kind"}
     assert restored.inspector.visible is True
 
 
@@ -126,10 +126,8 @@ def test_group_properties_are_applied_in_inspector_without_a_dialog():
     editor.draw_inspector()
     editor.property_fields["category"].value = "VIP"
     editor.property_fields["kind"].value = "aisle"
-    editor.property_fields["price_mode"].value = "custom"
-    editor.property_fields["price"].value = "777,50"
     editor.apply()
     assert all(editor.seats[index]["category"] == "VIP" for index in {0, 1, 3, 4})
     assert all(editor.seats[index]["enabled"] is False for index in {0, 1, 3, 4})
-    assert all(editor.seats[index]["price_override"] == 77750 for index in {0, 1, 3, 4})
+    assert all("price_override" not in seat for seat in editor.seats)
     assert editor.seats[2]["category"] == "стандарт"

@@ -7,18 +7,18 @@ from eventseat.domain import AppError
 from .conftest import seat_ids
 
 
-def test_category_prices_seat_override_aisles_and_session_snapshot(system):
+def test_category_prices_aisles_and_session_snapshot(system):
     admin, user = system["admin"], system["user"]
     layout = [
-        {"row": 1, "number": 1, "category": "эконом", "price_override": None, "enabled": True},
-        {"row": 1, "number": 2, "category": "VIP", "price_override": 17777, "enabled": True},
-        {"row": 1, "number": 3, "category": "стандарт", "price_override": None, "enabled": False},
+        {"row": 1, "number": 1, "category": "эконом", "enabled": True},
+        {"row": 1, "number": 2, "category": "VIP", "enabled": True},
+        {"row": 1, "number": 3, "category": "стандарт", "enabled": False},
     ]
     hall = admin.save_hall("Зал с проходом", 1, 3, "Экран", system["prices"], layout)
     session = admin.save_session(system["event"], hall, system["start"])
     seats = user.seat_map(session)
     assert len(seats) == 2
-    assert {(seat["number"], seat["price"]) for seat in seats} == {(1, 8000), (2, 17777)}
+    assert {(seat["number"], seat["price"]) for seat in seats} == {(1, 8000), (2, 15000)}
     admin.save_hall(
         "Новые цены шаблона",
         1,
@@ -30,32 +30,25 @@ def test_category_prices_seat_override_aisles_and_session_snapshot(system):
     )
     assert {(seat["number"], seat["price"]) for seat in user.seat_map(session)} == {
         (1, 8000),
-        (2, 17777),
+        (2, 15000),
     }
     later = admin.save_session(system["event"], hall, system["start"] + timedelta(days=1))
     assert {(seat["number"], seat["price"]) for seat in user.seat_map(later)} == {
         (1, 50000),
-        (2, 17777),
+        (2, 50000),
     }
 
 
-def test_session_specific_price_overrides_category_price(system):
+def test_session_price_overrides_are_not_part_of_public_api(system):
     admin = system["admin"]
     hall = admin.get_hall(system["hall"])
     seat = next(seat for seat in hall["seats"] if seat["enabled"])
-    session = admin.save_session(
-        system["event"],
-        system["hall"],
-        system["start"] + timedelta(days=1),
-        category_prices={category: 20000 for category in system["prices"]},
-        seat_prices={seat["id"]: 23123},
-    )
-    seats = admin.seat_map(session)
-    selected = next(
-        item for item in seats if (item["row"], item["number"]) == (seat["row"], seat["number"])
-    )
-    assert selected["price"] == 23123
-    assert sum(item["price"] == 20000 for item in seats) == len(seats) - 1
+    for overrides in ({"category_prices": system["prices"]}, {"seat_prices": {seat["id"]: 23123}}):
+        with pytest.raises(TypeError):
+            admin.save_session(
+                system["event"], system["hall"], system["start"] + timedelta(days=1), **overrides
+            )
+    assert not hasattr(admin, "set_session_prices")
 
 
 def test_copy_hall_keeps_layout_but_has_independent_identity(system):
@@ -65,7 +58,7 @@ def test_copy_hall_keeps_layout_but_has_independent_identity(system):
     assert original["id"] != copied["id"]
     assert copied["name"] == "Копия малого зала"
     assert copied["category_prices"] == original["category_prices"]
-    fields = ("row", "number", "category", "price_override", "enabled")
+    fields = ("row", "number", "category", "enabled")
     assert [tuple(seat[key] for key in fields) for seat in copied["seats"]] == [
         tuple(seat[key] for key in fields) for seat in original["seats"]
     ]
@@ -241,4 +234,4 @@ def test_statistics_count_active_bookings_and_amount_not_cancelled_tickets(syste
 )
 def test_money_accepts_only_nonnegative_integer_kopecks(system, prices):
     with pytest.raises(AppError):
-        system["admin"].set_session_prices(system["session"], prices)
+        system["admin"].save_hall("Неверные цены", 1, 2, "Сцена", prices)

@@ -54,9 +54,10 @@ def test_booking_state_transition_checks_owner_and_preserves_tickets():
     assert len(booking) == 1
 
 
-def test_seat_override_can_be_zero_and_does_not_fall_back_to_category():
-    seat = Seat(1, 1, "VIP", price_override=0)
-    assert seat.price({"VIP": 15000}) == 0
+def test_seat_uses_its_category_price_including_free_category():
+    seat = Seat(1, 1, "VIP")
+    assert seat.price({"VIP": 0}) == 0
+    assert seat.price({"VIP": 15000}) == 15000
 
 
 @pytest.mark.parametrize("value", [-1, True, 10.5, "100"])

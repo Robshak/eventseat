@@ -19,7 +19,6 @@ from eventseat.ui import (
     hoverable,
     money,
     panel,
-    rubles,
     select,
     tag,
     text,
@@ -97,6 +96,8 @@ class HallEditor:
             control.on_change = self.app.safe(self.changed)
             control.on_focus = self.app.safe(self.clear_modifiers)
         self.seats = saved.get("seats", deepcopy(hall.get("seats", [])))
+        for seat in self.seats:
+            seat.pop("price_override", None)
         self.dimensions = saved.get(
             "dimensions", {"rows": hall.get("rows", 6), "columns": hall.get("columns", 10)}
         )
@@ -247,11 +248,6 @@ class HallEditor:
                             border=ft.Border.all(2, TEAL if selected else LINE),
                             tooltip=f"Ряд {seat['row']}, место {seat['number']} · "
                             + (seat["category"] if seat["enabled"] else "проход")
-                            + (
-                                f" · {money(seat['price_override'])}"
-                                if seat.get("price_override") is not None
-                                else ""
-                            )
                             + (" · выделено" if selected else ""),
                             on_click=self.app.safe(lambda _, item=index: self.click(item)),
                             data={"hall_seat_index": index, "selected": selected},
@@ -325,49 +321,20 @@ class HallEditor:
             [("unchanged", "Не менять"), ("seat", "Кресло"), ("aisle", "Проход")],
             ("seat" if seat["enabled"] else "aisle") if single else "unchanged",
         )
-        price_mode = select(
-            "Цена выделенных мест",
-            [
-                ("unchanged", "Не менять"),
-                ("category", "По категории"),
-                ("custom", "Индивидуальная"),
-            ],
-            ("custom" if seat.get("price_override") is not None else "category")
-            if single
-            else "unchanged",
-        )
-        price = field(
-            "Индивидуальная цена, ₽",
-            f"{seat['price_override'] / 100:.2f}"
-            if single and seat.get("price_override") is not None
-            else "",
-        )
-        self.property_fields.update(
-            category=category, kind=kind, price_mode=price_mode, price=price
-        )
+        self.property_fields.update(category=category, kind=kind)
         if restored:
             for key, value in restored.items():
                 if key in self.property_fields:
                     self.property_fields[key].value = value
-        price.visible = price_mode.value == "custom"
-
-        def mode_changed(_):
-            price.visible = price_mode.value == "custom"
-            self.capture()
-            self.page.update()
-
         for control in self.property_fields.values():
             if isinstance(control, ft.Dropdown):
                 control.on_select = self.app.safe(self.changed)
             else:
                 control.on_change = self.app.safe(self.changed)
             control.on_focus = self.app.safe(self.clear_modifiers)
-        price_mode.on_select = self.app.safe(mode_changed)
         controls += [
             category,
             kind,
-            price_mode,
-            price,
             self.app.button("Применить к выделенным", self.apply),
             text("Изменения применяются к черновику. Затем нажмите «Сохранить зал».", 12, MUTED),
         ]
@@ -380,8 +347,6 @@ class HallEditor:
             self.selection.selected,
             category=None if values["category"] == "unchanged" else values["category"],
             enabled=None if values["kind"] == "unchanged" else values["kind"] == "seat",
-            price_mode=values["price_mode"],
-            price=rubles(values["price"]) if values["price_mode"] == "custom" else None,
             number=int(values["number"]) if "number" in values else None,
         )
         self.refresh_selection()
@@ -391,7 +356,7 @@ class HallEditor:
         self.clear_modifiers()
         self.app.confirm(
             "Перестроить схему?",
-            "Категории, проходы и индивидуальные цены в текущем редакторе будут сброшены.",
+            "Категории, номера кресел и проходы в текущем редакторе будут сброшены.",
             lambda _: self.generate(),
         )
 
@@ -412,7 +377,6 @@ class HallEditor:
                 "row": first_row + row,
                 "number": first_seat + column,
                 "category": "стандарт",
-                "price_override": None,
                 "enabled": True,
             }
             for row in range(rows)
@@ -441,11 +405,7 @@ class HallEditor:
                             border_radius=8,
                             alignment=ft.Alignment.CENTER,
                             bgcolor=CATEGORY_COLORS[seat["category"]] if seat["enabled"] else None,
-                            tooltip=money(
-                                seat.get("price_override")
-                                if seat.get("price_override") is not None
-                                else prices[seat["category"]]
-                            )
+                            tooltip=money(prices[seat["category"]])
                             if seat["enabled"]
                             else "Проход",
                         )

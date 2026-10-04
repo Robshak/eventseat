@@ -29,7 +29,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 from eventseat.domain import AppError
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class Base(DeclarativeBase):
@@ -340,6 +340,11 @@ class Store:
                 if version < 4:
                     self._migrate_booking_layouts(connection)
                     connection.exec_driver_sql("PRAGMA user_version = 4")
+                if version < 5:
+                    # Session prices are historical snapshots, including legacy overrides.
+                    # Only hall templates change to category-only pricing.
+                    connection.exec_driver_sql("UPDATE seats SET price_override = NULL")
+                    connection.exec_driver_sql("PRAGMA user_version = 5")
                 if fresh and self._seed_new:
                     connection.exec_driver_sql(
                         "INSERT INTO settings (key, value) VALUES ('demo_pending', '1')"

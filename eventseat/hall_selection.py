@@ -46,8 +46,6 @@ def apply_properties(
     *,
     category: str | None = None,
     enabled: bool | None = None,
-    price_mode: str = "unchanged",
-    price: int | None = None,
     number: int | None = None,
 ):
     """Validate the entire change before mutating any selected seat."""
@@ -55,10 +53,6 @@ def apply_properties(
         raise AppError("Сначала выделите кресло или группу кресел.")
     if category is not None and category not in {"эконом", "стандарт", "VIP"}:
         raise AppError("Выберите категорию кресла.")
-    if price_mode not in {"unchanged", "category", "custom"}:
-        raise AppError("Выберите способ расчёта цены.")
-    if price_mode == "custom" and (price is None or price < 0):
-        raise AppError("Укажите неотрицательную индивидуальную цену.")
     if number is not None:
         if len(selected) != 1:
             raise AppError("Номер можно изменить только у одного выделенного кресла.")
@@ -76,7 +70,5 @@ def apply_properties(
             seat["category"] = category
         if enabled is not None:
             seat["enabled"] = enabled
-        if price_mode != "unchanged":
-            seat["price_override"] = price if price_mode == "custom" else None
         if number is not None:
             seat["number"] = number

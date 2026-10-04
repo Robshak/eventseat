@@ -25,16 +25,26 @@ def test_event_interval_includes_both_days_and_projects_only_matching_sessions(s
     last_start = (first_day + timedelta(days=2)).replace(hour=23, minute=59)
 
     def schedule(start, price):
+        hall = admin.get_hall(system["hall"])
+        admin.save_hall(
+            hall["name"],
+            hall["rows"],
+            hall["columns"],
+            hall["stage"],
+            {category: price for category in system["prices"]},
+            hall["seats"],
+            hall_id=hall["id"],
+        )
         return admin.save_session(
             system["event"],
             system["hall"],
             start,
-            category_prices={category: price for category in system["prices"]},
         )
 
     schedule(first_day - timedelta(days=1), 100)
     schedule(first_day, 30000)
-    admin.set_session_prices(system["session"], {category: 40000 for category in system["prices"]})
+    admin.cancel_session(system["session"], "Замена расписания")
+    schedule(system["start"], 40000)
     cancelled = schedule(first_day + timedelta(days=1), 200)
     admin.cancel_session(cancelled, "Сеанс исключён из афиши")
     schedule(last_start, 20000)

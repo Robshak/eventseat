@@ -12,8 +12,10 @@ from uuid import uuid4
 import flet as ft
 
 from eventseat import __version__
+from eventseat.account_menu import AccountMenu
 from eventseat.account_sessions import AccountSessions
 from eventseat.config import asset_path
+from eventseat.date_input import DateInput
 from eventseat.domain import AppError, PriceChanged
 from eventseat.view_state import AccountViewState, ViewStates
 
@@ -96,7 +98,7 @@ def panel(*controls, **kwargs):
     return ft.Container(
         ft.Column(list(controls), spacing=16),
         bgcolor=WHITE,
-        padding=24,
+        padding=kwargs.pop("padding", 24),
         border_radius=18,
         border=ft.Border.all(1, LINE),
         **kwargs,
@@ -156,6 +158,7 @@ class App:
         self.page.services.append(self.picker)
         self.content = ft.Column(expand=True, spacing=20, scroll=ft.ScrollMode.AUTO)
         self.nav = ft.Column(spacing=7)
+        self.account_menu = None
 
     @property
     def service(self):
@@ -243,6 +246,8 @@ class App:
 
         def window_event(event):
             if event.type in (ft.WindowEventType.BLUR, ft.WindowEventType.HIDE):
+                if self.account_menu:
+                    self.account_menu.close()
                 if self.on_view_blur:
                     self.on_view_blur()
 
@@ -370,40 +375,8 @@ class App:
             offset = self.view_state.scroll_offsets.get(AccountViewState.route_key(self._route), 0)
             self.page.run_task(self._restore_scroll, self._view_generation, offset)
 
-    def date_field(self, label, value="", width=200):
-        target = field(label, value, width=width)
-
-        def calendar(_):
-            try:
-                selected = datetime.strptime(target.value, "%d.%m.%Y") if target.value else None
-            except ValueError:
-                selected = None
-
-            def changed(event):
-                if event.control.value:
-                    target.value = event.control.value.strftime("%d.%m.%Y")
-                    target.update()
-
-            self.page.show_dialog(
-                ft.DatePicker(
-                    value=selected,
-                    first_date=datetime(2000, 1, 1),
-                    last_date=datetime(2100, 12, 31),
-                    on_change=self.safe(changed),
-                    help_text=label,
-                    cancel_text="Отмена",
-                    confirm_text="Выбрать",
-                    field_label_text="Дата",
-                    field_hint_text="ДД.ММ.ГГГГ",
-                )
-            )
-
-        target.suffix_icon = ft.IconButton(
-            icon=ft.Icons.CALENDAR_MONTH_OUTLINED,
-            tooltip="Выбрать дату: " + label,
-            on_click=self.safe(calendar),
-        )
-        return target
+    def date_field(self, label, value="", width=210, **kwargs):
+        return DateInput(self, label, value, width=width, **kwargs)
 
     def auth(self, mode="login"):
         if self.service.current_user is not None:
@@ -558,89 +531,7 @@ class App:
             )
             for label, icon, action in entries
         ]
-        account_selector = ft.PopupMenuButton(
-            content=ft.Container(
-                ft.Column(
-                    [
-                        text("Аккаунты", 11, "#B9CAD8"),
-                        ft.Row(
-                            [
-                                text(
-                                    "@" + user["login"],
-                                    13,
-                                    WHITE,
-                                    True,
-                                    expand=True,
-                                    max_lines=1,
-                                    overflow=ft.TextOverflow.ELLIPSIS,
-                                ),
-                                ft.Icon(ft.Icons.UNFOLD_MORE, color="#91DAD3", size=19),
-                            ]
-                        ),
-                    ],
-                    spacing=5,
-                ),
-                bgcolor="#203B53",
-                border=ft.Border.all(1, "#66869D"),
-                border_radius=10,
-                padding=12,
-            ),
-            items=[
-                ft.PopupMenuItem(
-                    content=ft.Row(
-                        [
-                            ft.Icon(
-                                ft.Icons.CHECK_CIRCLE_OUTLINE
-                                if account["id"] == user["id"]
-                                else ft.Icons.PERSON_OUTLINE,
-                                color="#91DAD3",
-                                size=22,
-                            ),
-                            ft.Column(
-                                [
-                                    text(
-                                        account["name"],
-                                        14,
-                                        WHITE,
-                                        True,
-                                        max_lines=1,
-                                        overflow=ft.TextOverflow.ELLIPSIS,
-                                    ),
-                                    text(
-                                        "@"
-                                        + account["login"]
-                                        + (
-                                            " · Администратор"
-                                            if account["role"] == "admin"
-                                            else " · Пользователь"
-                                        ),
-                                        12,
-                                        "#C7D8E4",
-                                        max_lines=1,
-                                        overflow=ft.TextOverflow.ELLIPSIS,
-                                    ),
-                                ],
-                                spacing=3,
-                                expand=True,
-                            ),
-                        ],
-                        spacing=12,
-                    ),
-                    height=68,
-                    padding=12,
-                    data={"account_id": account["id"]},
-                    on_click=self.safe(lambda _, uid=account["id"]: self.switch_account(uid)),
-                )
-                for account in self.accounts.users
-            ],
-            bgcolor=NAVY,
-            padding=0,
-            menu_padding=6,
-            shape=ft.RoundedRectangleBorder(radius=12, side=ft.BorderSide(1, "#66869D")),
-            size_constraints=ft.BoxConstraints(min_width=300, max_width=380, max_height=400),
-            tooltip="Переключить аккаунт",
-            data="account-switcher",
-        )
+        self.account_menu = AccountMenu(self, user)
         sidebar = ft.Container(
             ft.Column(
                 [
@@ -663,10 +554,11 @@ class App:
                         max_lines=1,
                         overflow=ft.TextOverflow.ELLIPSIS,
                     ),
-                    account_selector,
+                    self.account_menu.trigger,
                     ft.TextButton(
                         "Добавить аккаунт",
                         icon=ft.Icons.PERSON_ADD_ALT_1,
+                        height=40,
                         on_click=self.safe(lambda _: self.add_account()),
                         style=ft.ButtonStyle(
                             color="#C4D6E2",
@@ -676,7 +568,7 @@ class App:
                             },
                         ),
                     ),
-                    text(f"v{__version__} · Локальное приложение", 10, "#8FA9BB"),
+                    text(f"v{__version__} · Локальное приложение", 10, "#8FA9BB", height=14),
                 ],
                 spacing=10,
                 expand=True,
@@ -686,11 +578,18 @@ class App:
             padding=24,
         )
         self.page.controls = [
-            ft.Row(
-                [sidebar, ft.Container(self.content, padding=30, expand=True)],
-                spacing=0,
+            ft.Stack(
+                [
+                    ft.Row(
+                        [sidebar, ft.Container(self.content, padding=30, expand=True)],
+                        spacing=0,
+                        expand=True,
+                        vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+                    ),
+                    self.account_menu.backdrop,
+                    self.account_menu.popup,
+                ],
                 expand=True,
-                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
             )
         ]
         self.page.update()
@@ -823,47 +722,16 @@ class App:
         category_field = select(
             "Категория", [("", "Все категории"), *CATEGORIES], values.get("category", ""), width=165
         )
-        from_field = field("С · ДД.ММ.ГГГГ", values.get("date_from", ""), width=200)
-        to_field = field("По · ДД.ММ.ГГГГ", values.get("date_to", ""), width=200)
-
-        def calendar(target, label):
-            try:
-                selected = datetime.strptime(target.value, "%d.%m.%Y") if target.value else None
-            except ValueError:
-                selected = None
-
-            def changed(event):
-                if event.control.value:
-                    target.value = event.control.value.strftime("%d.%m.%Y")
-                    target.update()
-
-            self.page.show_dialog(
-                ft.DatePicker(
-                    value=selected,
-                    first_date=datetime(2000, 1, 1),
-                    last_date=datetime(2100, 12, 31),
-                    help_text=label,
-                    cancel_text="Отмена",
-                    confirm_text="Выбрать",
-                    field_label_text="Дата",
-                    field_hint_text="ДД.ММ.ГГГГ",
-                    on_change=self.safe(changed),
-                )
-            )
-
-        for date_field, label in [
-            (from_field, "Выбрать начальную дату"),
-            (to_field, "Выбрать конечную дату"),
-        ]:
-            date_field.suffix_icon = ft.IconButton(
-                icon=ft.Icons.CALENDAR_MONTH_OUTLINED,
-                tooltip=label,
-                on_click=self.safe(
-                    lambda _, target=date_field, label=label: calendar(target, label)
-                ),
-            )
+        from_field = self.date_field(
+            "С · ДД.ММ.ГГГГ", values.get("date_from", ""), tooltip="Выбрать начальную дату"
+        )
+        to_field = self.date_field(
+            "По · ДД.ММ.ГГГГ", values.get("date_to", ""), tooltip="Выбрать конечную дату"
+        )
 
         def apply(_):
+            from_field.read()
+            to_field.read()
             self.catalogue(
                 search_field.value.strip(),
                 category_field.value or "",
@@ -1434,6 +1302,9 @@ class App:
 
     def bookings(self, admin=False, search=""):
         admin = admin or self.service.current_user["role"] == "admin"
+        if admin:
+            self.admin("Бронирования", search)
+            return
         self.set_view(
             {
                 "section": "Администрирование" if admin else "Мои бронирования",

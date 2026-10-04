@@ -256,7 +256,7 @@ def test_admin_form_route_and_unfinished_values_survive_profile_roundtrip(
     assert form_field(app, label).value == draft
 
 
-@pytest.mark.parametrize("tab", ["Сеансы", "Статистика"])
+@pytest.mark.parametrize("tab", ["Сеансы", "Бронирования"])
 def test_admin_partial_filter_survives_profile_roundtrip(app_factory, tab):
     app = app_factory("admin")
     app.admin(tab)
@@ -267,14 +267,14 @@ def test_admin_partial_filter_survives_profile_roundtrip(app_factory, tab):
     assert app._route["tab"] == tab
 
 
-@pytest.mark.parametrize("tab, prefix", [("Сеансы", "session"), ("Статистика", "statistics")])
+@pytest.mark.parametrize("tab, prefix", [("Сеансы", "session"), ("Бронирования", "booking")])
 def test_invalid_admin_apply_keeps_last_valid_result_and_raw_draft(
     app_factory, system, tab, prefix
 ):
     app = app_factory("admin")
     app.admin(tab)
     day = system["start"].strftime("%d.%m.%Y")
-    apply_label = "Применить фильтры" if tab == "Статистика" else "Применить"
+    apply_label = "Применить фильтры" if tab == "Бронирования" else "Применить"
     form_field(app, "С · ДД.ММ.ГГГГ").value = day
     form_field(app, "По · ДД.ММ.ГГГГ").value = day
     invoke(button(app, apply_label).on_click)

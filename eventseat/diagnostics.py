@@ -77,9 +77,11 @@ async def verify(app, folder: Path, phase: str):
     async def choose(label, value):
         if label == "Аккаунты":
             selector = next(c for c in controls() if getattr(c, "data", None) == "account-switcher")
+            if not app.account_menu.opened:
+                await invoke(selector.on_click)
             item = next(
                 item
-                for item in selector.items
+                for item in app.account_menu.items
                 if isinstance(item.data, dict) and item.data.get("account_id") == int(value)
             )
             await invoke(item.on_click, SimpleNamespace(control=item))
@@ -107,11 +109,40 @@ async def verify(app, folder: Path, phase: str):
         ]
         check(len(matches) == 1, f"Календарь доступен: {tooltip}")
         await invoke(matches[0].on_click)
-        picker = next(c for c in controls() if isinstance(c, ft.DatePicker) and c.open)
-        picker.value = day
-        await invoke(picker.on_change, SimpleNamespace(control=picker))
-        picker.open = False
-        page.update()
+        picker = next(c for c in controls() if getattr(c, "data", None) == "date-picker" and c.open)
+        fields = {c.label: c for c in descendants(picker) if isinstance(c, ft.Dropdown)}
+        for label, value in (("Год", day.year), ("Месяц", day.month)):
+            fields[label].value = str(value)
+            await invoke(fields[label].on_select, SimpleNamespace(control=fields[label]))
+        chosen = next(
+            c
+            for c in descendants(picker)
+            if isinstance(getattr(c, "data", None), dict)
+            and c.data.get("date") == day.date().isoformat()
+        )
+        await invoke(chosen.on_click)
+        if tooltip == "Выбрать начальную дату":
+            await snapshot("date-calendar", dialog=True)
+        await press("Выбрать")
+        target = next(
+            c
+            for c in controls()
+            if isinstance(c, ft.TextField) and getattr(c.suffix_icon, "tooltip", None) == tooltip
+        )
+        check(
+            target.value == day.strftime("%d.%m.%Y"),
+            "Календарь сохраняет выбранный день без сдвига",
+        )
+
+    async def type_date(label, digits):
+        target = next(c for c in controls() if isinstance(c, ft.TextField) and c.label == label)
+        target.value = digits
+        target.selection = ft.TextSelection(len(digits), len(digits))
+        await invoke(target.on_change, SimpleNamespace(control=target, data=digits))
+        check(
+            target.value == f"{digits[:2]}.{digits[2:4]}.{digits[4:]}",
+            "Ввод даты автоматически расставляет точки",
+        )
 
     async def hover(control, label, screenshot=None):
         check(callable(control.on_hover), f"Есть обработчик наведения: {label}")
@@ -274,8 +305,14 @@ async def verify(app, folder: Path, phase: str):
                 "Shift + клик выделяет прямоугольную группу мест",
             )
             await choose("Категория мест", "VIP")
-            await choose("Цена выделенных мест", "custom")
-            fill("Индивидуальная цена, ₽", "575")
+            check(
+                not any(
+                    isinstance(c, (ft.TextField, ft.Dropdown))
+                    and c.label in ("Цена выделенных мест", "Индивидуальная цена, ₽")
+                    for c in controls()
+                ),
+                "В свойствах кресла нет индивидуальных цен",
+            )
             app.navigate("Профиль", app.profile)
             app.navigate("Администрирование", app.admin)
             check(
@@ -286,9 +323,9 @@ async def verify(app, folder: Path, phase: str):
                 next(
                     c
                     for c in controls()
-                    if isinstance(c, ft.TextField) and c.label == "Индивидуальная цена, ₽"
+                    if isinstance(c, ft.Dropdown) and c.label == "Категория мест"
                 ).value
-                == "575",
+                == "VIP",
                 "Несохранённые параметры группы сохраняются при навигации",
             )
             await press("Применить к выделенным")
@@ -309,11 +346,11 @@ async def verify(app, folder: Path, phase: str):
             saved_hall = app.service.get_hall(hall_id)
             check(
                 sum(
-                    s["price_override"] == 57500 and s["category"] == "VIP"
+                    s.get("price_override") is None and s["category"] == "VIP"
                     for s in saved_hall["seats"]
                 )
                 == 4,
-                "Категория и индивидуальная цена применены ко всей выделенной группе",
+                "Категория применена ко всей группе, индивидуальных цен нет",
             )
             await snapshot("admin-halls")
             app.admin("Мероприятия")
@@ -395,8 +432,12 @@ async def verify(app, folder: Path, phase: str):
                 any(f"Сеанс №{session_id}" in str(value) for value in visible_texts(app.content)),
                 "Карточка открывает конкретный сеанс с номером, временем и залом",
             )
-            await snapshot("session-detail")
-            await press("Мероприятие")
+            check(
+                bool(buttons("Сохранить сеанс")) and not buttons("Цены мест"),
+                "Карточка сразу открывает редактирование без отдельного экрана цен",
+            )
+            await snapshot("session-edit-direct")
+            await press("К мероприятию")
             check(
                 next(
                     c for c in controls() if isinstance(c, ft.TextField) and c.label == "Название"
@@ -405,7 +446,7 @@ async def verify(app, folder: Path, phase: str):
                 "Из сеанса открыт редактор связанного мероприятия",
             )
             app.session_detail(session_id)
-            await press("Редактировать зал")
+            await press("К залу")
             check(
                 next(
                     c
@@ -434,7 +475,8 @@ async def verify(app, folder: Path, phase: str):
                 == str(hall_id),
                 "Из карточки зала открыто его расписание",
             )
-            app.admin("Статистика")
+            app.admin("Бронирования")
+            check(not buttons("Статистика"), "Отдельная вкладка статистики убрана")
             await choose("Мероприятие", event_id)
             await choose("Зал", hall_id)
             fill("С · ДД.ММ.ГГГГ", first_start.strftime("%d.%m.%Y"))
@@ -457,7 +499,7 @@ async def verify(app, folder: Path, phase: str):
                     c for c in controls() if isinstance(c, ft.Dropdown) and c.label == "Зал"
                 ).value
                 == str(hall_id),
-                "Возвращение в администрирование восстанавливает вкладку статистики и фильтры",
+                "Возвращение в администрирование восстанавливает объединённую вкладку бронирований и фильтры",
             )
             fill("С · ДД.ММ.ГГГГ", "12.")
             app.navigate("Профиль", app.profile)
@@ -497,16 +539,20 @@ async def verify(app, folder: Path, phase: str):
             )
             await snapshot("focused-session")
             later_start = first_start + timedelta(days=10)
-            app.service.save_session(
-                event_id,
-                hall_id,
-                later_start,
+            hall = app.service.get_hall(hall_id)
+            app.service.save_hall(
+                hall["name"],
+                hall["rows"],
+                hall["columns"],
+                hall["stage"],
                 {"эконом": 120000, "стандарт": 135000, "VIP": 160000},
-                seat_prices={
-                    seat["id"]: 120000
-                    for seat in app.service.get_hall(hall_id)["seats"]
-                    if seat["enabled"]
-                },
+                hall["seats"],
+                hall_id,
+            )
+            app.service.save_session(event_id, hall_id, later_start)
+            check(
+                app.service.get_session(session_id)["category_prices"]["эконом"] == 20000,
+                "Изменение цен зала не меняет цены ранее созданного сеанса",
             )
             await press("Добавить аккаунт")
             await press("Нет аккаунта? Зарегистрироваться")
@@ -528,20 +574,32 @@ async def verify(app, folder: Path, phase: str):
                 c for c in controls() if getattr(c, "data", None) == "account-switcher"
             )
             check(
-                isinstance(account_selector, ft.PopupMenuButton)
-                and account_selector.shape.side.width >= 1,
+                isinstance(account_selector, ft.TextButton)
+                and app.account_menu.popup.border.left.width >= 1,
                 "Переключатель аккаунтов имеет отдельное меню с контрастной рамкой",
             )
             check(
                 all(
                     any(isinstance(c, ft.Text) and c.color == "#FFFFFF" for c in descendants(item))
-                    for item in account_selector.items
+                    for item in app.account_menu.items
                 ),
                 "Имена в меню аккаунтов отображаются светлым текстом на тёмном фоне",
             )
+            await invoke(account_selector.on_click)
+            check(
+                app.account_menu.popup.visible
+                and app.account_menu.popup.bottom
+                > app.account_menu.FOOTER_HEIGHT + account_selector.height
+                and app.account_menu.popup.left + app.account_menu.popup.width <= 238,
+                "Меню раскрывается вверх и остаётся внутри боковой панели",
+            )
+            await snapshot("account-menu-open")
+            await invoke(app.account_menu.listener.on_key_down, SimpleNamespace(key="Escape"))
+            check(not app.account_menu.opened, "Escape закрывает меню аккаунтов")
             fill("Найти событие", "Вечер в EventSeat")
             await calendar("Выбрать начальную дату", later_start)
             await calendar("Выбрать конечную дату", later_start)
+            await type_date("По · ДД.ММ.ГГГГ", later_start.strftime("%d%m%Y"))
             await press("Найти")
             from eventseat.ui import date_text, money
 
@@ -551,6 +609,18 @@ async def verify(app, folder: Path, phase: str):
                 and "от " + money(120000) in visible_texts(app.content),
                 "Обе границы включены; карточка показывает дату и цену сеанса внутри интервала",
             )
+            fill("С · ДД.ММ.ГГГГ", "31.02.2026")
+            await press("Найти")
+            invalid = next(
+                c for c in controls() if isinstance(c, ft.TextField) and c.label == "С · ДД.ММ.ГГГГ"
+            )
+            check(
+                bool(invalid.error_text) and "Событий: 1" in visible_texts(app.content),
+                "Невозможная дата показывает ошибку и сохраняет предыдущую выдачу",
+            )
+            dismiss()
+            fill("С · ДД.ММ.ГГГГ", later_start.strftime("%d.%m.%Y"))
+            await press("Найти")
             card = next(
                 c
                 for c in descendants(app.content)
@@ -702,6 +772,45 @@ async def verify(app, folder: Path, phase: str):
                 "Места по билету" in visible_texts(app.content),
                 "Возврат сохраняет карту конкретного билета",
             )
+            dismiss()
+            await press("Добавить аккаунт")
+            fill("Логин", "qa_admin")
+            fill("Пароль", password)
+            await press("Войти")
+            app.admin("Бронирования")
+            fill("Поиск по номеру, имени или логину", booking["number"])
+            await choose("Сеанс", session_id)
+            await choose("Состояние брони", "active")
+            await press("Применить фильтры")
+            check(
+                "Найдено бронирований: 1" in visible_texts(app.content)
+                and any(
+                    isinstance(getattr(c, "data", None), dict)
+                    and c.data.get("booking_id") == booking["id"]
+                    for c in controls()
+                ),
+                "Общие фильтры находят оформленную бронь по номеру, сеансу и статусу",
+            )
+            metrics = {}
+            for c in descendants(app.content):
+                if isinstance(c, ft.Container) and isinstance(c.content, ft.Column):
+                    parts = c.content.controls
+                    if len(parts) == 2 and all(isinstance(v, ft.Text) for v in parts):
+                        metrics[parts[0].value] = parts[1].value
+            check(
+                metrics.get("Бронирований по фильтру") == "1"
+                and metrics.get("Билетов по фильтру") == "1"
+                and metrics.get("Сумма по фильтру") == money(booking["total"]),
+                "Показатели соответствуют отфильтрованному списку бронирований",
+            )
+            await snapshot("combined-bookings")
+            fill("Поиск по номеру, имени или логину", "несуществующее бронирование")
+            await press("Применить фильтры")
+            check(
+                "Найдено бронирований: 0" in visible_texts(app.content),
+                "Общий поиск обновляет список без совпадений",
+            )
+            await choose("Аккаунты", user_id)
             dismiss()
             app.profile()
             fill("Отображаемое имя", "Имя в черновике профиля")

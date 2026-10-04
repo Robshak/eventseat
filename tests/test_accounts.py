@@ -108,7 +108,6 @@ def test_password_is_argon2_hash_not_plaintext(system):
         lambda service, data: service.save_hall("Чужой зал", 2, 2, "Экран", data["prices"]),
         lambda service, data: service.save_session(data["event"], data["hall"], data["start"]),
         lambda service, data: service.cancel_session(data["session"], "Нет прав"),
-        lambda service, data: service.set_session_prices(data["session"], data["prices"]),
         lambda service, data: service.list_bookings(admin=True),
         lambda service, data: service.list_events(admin=True),
         lambda service, data: service.statistics(),

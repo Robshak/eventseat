@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 from datetime import datetime, timedelta
 
 import flet as ft
@@ -9,9 +8,7 @@ import flet as ft
 from eventseat.config import import_cover
 from eventseat.domain import AppError
 from eventseat.ui import (
-    BG,
     CATEGORIES,
-    CATEGORY_COLORS,
     MUTED,
     RED,
     SEAT_CATEGORIES,
@@ -43,6 +40,8 @@ class AdminUI:
     ):
         self.app.capture_view()
         self.app.clear_capture()
+        if tab == "Статистика":
+            tab = "Бронирования"
         if self.service.current_user["role"] != "admin":
             raise AppError("Это действие доступно только администратору.")
         if tab == "Сеансы" and (event_id is not None or hall_id is not None):
@@ -69,16 +68,14 @@ class AdminUI:
         self.app.set_view(
             {"section": "Администрирование", "page": "list", "tab": tab, "search": search}
         )
-        if tab == "Бронирования":
-            self.app.bookings(True, search)
-            self.app.content.controls.insert(0, self.tabs(tab))
-            self.page.update()
-            return
+        if tab == "Бронирования" and search:
+            for key in ("admin:booking_filters", "admin:booking_applied"):
+                self.drafts.setdefault(key, {})["search"] = search
         render = {
             "Мероприятия": self.events,
             "Сеансы": lambda: self.sessions(focus_session_id),
             "Залы": self.halls,
-            "Статистика": self.statistics,
+            "Бронирования": self.bookings,
         }[tab]
         self.app.show(
             self.app.heading(
@@ -106,7 +103,7 @@ class AdminUI:
                 self.app.button(
                     label, lambda _, name=label: self.show(name), secondary=label != selected
                 )
-                for label in ["Мероприятия", "Сеансы", "Залы", "Бронирования", "Статистика"]
+                for label in ["Мероприятия", "Сеансы", "Залы", "Бронирования"]
             ],
             wrap=True,
             spacing=10,
@@ -124,13 +121,7 @@ class AdminUI:
                         self.app.cover(event.get("cover_path", ""), 130, 90),
                         ft.Column(
                             [
-                                ft.TextButton(
-                                    content=text(event["title"], 20, TEAL, bold=True),
-                                    tooltip="Сеансы мероприятия",
-                                    on_click=self.app.safe(
-                                        lambda _, eid=event["id"]: self.show("Сеансы", event_id=eid)
-                                    ),
-                                ),
+                                text(event["title"], 20, bold=True),
                                 text(
                                     f"{event['category']} · {event['duration']} мин",
                                     color=MUTED,
@@ -327,6 +318,8 @@ class AdminUI:
 
         def refresh(_):
             capture()
+            date_from.read()
+            date_to.read()
             filters = self.drafts["admin:session_filters"]
             self.service.list_sessions(**self.session_query(filters))
             self.drafts["admin:session_applied"] = dict(filters)
@@ -351,7 +344,7 @@ class AdminUI:
                         ),
                         icon=ft.Icons.ADD,
                     ),
-                    text("Нажмите на сеанс, чтобы открыть его сведения и управление.", color=MUTED),
+                    text("Нажмите на сеанс, чтобы открыть его редактор.", color=MUTED),
                 ],
                 wrap=True,
             ),
@@ -381,18 +374,18 @@ class AdminUI:
                     "Заполненность и места",
                     lambda _, sid=session["id"]: self.app.seats(sid, True),
                     secondary=True,
-                )
+                ),
+                self.app.button(
+                    "К залу",
+                    lambda _, hid=session["hall_id"]: self.hall_form(hid),
+                    secondary=True,
+                ),
             ]
             if not is_cancelled and is_future:
                 actions += [
                     self.app.button(
                         "Изменить",
                         lambda _, sid=session["id"]: self.session_form(session_id=sid),
-                        secondary=True,
-                    ),
-                    self.app.button(
-                        "Цены мест",
-                        lambda _, sid=session["id"]: self.session_prices(sid),
                         secondary=True,
                     ),
                     self.app.button(
@@ -404,14 +397,7 @@ class AdminUI:
             card = panel(
                 ft.Row(
                     [
-                        ft.TextButton(
-                            content=text(session["title"], 21, TEAL, bold=True),
-                            tooltip="Открыть сеанс",
-                            on_click=self.app.safe(
-                                lambda _, sid=session["id"]: self.session_detail(sid)
-                            ),
-                            expand=True,
-                        ),
+                        text(session["title"], 21, bold=True, expand=True),
                         tag(
                             state,
                             RED if is_cancelled else TEAL,
@@ -435,7 +421,7 @@ class AdminUI:
                 ),
                 ft.Row(actions, wrap=True),
                 key=ft.ScrollKey(f"session-{session['id']}"),
-                on_click=self.app.safe(lambda _, sid=session["id"]: self.session_detail(sid)),
+                on_click=self.app.safe(lambda _, sid=session["id"]: self.session_form(sid)),
             )
             if session["id"] == focus_session_id:
                 card.bgcolor = "#E4F3F1"
@@ -465,78 +451,7 @@ class AdminUI:
         }
 
     def session_detail(self, session_id):
-        self.app.capture_view()
-        session = self.service.get_session(session_id)
-        self.app.set_view(
-            {
-                "section": "Администрирование",
-                "page": "session_detail",
-                "session_id": session_id,
-            }
-        )
-        editable = session["status"] != "cancelled" and session["start"] > datetime.now()
-        state = (
-            "Отменён"
-            if session["status"] == "cancelled"
-            else "Предстоящий"
-            if editable
-            else "Завершён"
-        )
-        actions = [
-            self.app.button("Заполненность и места", lambda _: self.app.seats(session_id, True)),
-            self.app.button(
-                "Мероприятие", lambda _: self.event_form(session["event_id"]), secondary=True
-            ),
-            self.app.button(
-                "Редактировать зал", lambda _: self.hall_form(session["hall_id"]), secondary=True
-            ),
-            self.app.button(
-                "Сеансы этого зала",
-                lambda _: self.show("Сеансы", hall_id=session["hall_id"]),
-                secondary=True,
-            ),
-        ]
-        if editable:
-            actions.extend(
-                [
-                    self.app.button(
-                        "Изменить сеанс", lambda _: self.session_form(session_id), secondary=True
-                    ),
-                    self.app.button(
-                        "Цены мест", lambda _: self.session_prices(session_id), secondary=True
-                    ),
-                    self.app.button(
-                        "Отменить сеанс", lambda _: self.cancel_session(session), secondary=True
-                    ),
-                ]
-            )
-        self.app.show(
-            self.app.button(
-                "К сеансам",
-                lambda _: self.show("Сеансы", focus_session_id=session_id),
-                icon=ft.Icons.ARROW_BACK,
-                secondary=True,
-            ),
-            self.app.heading(
-                session["title"], f"Сеанс №{session_id} · {date_text(session['start'])}"
-            ),
-            panel(
-                tag(state, RED if session["status"] == "cancelled" else TEAL),
-                text(session["hall_name"], 23, bold=True),
-                text(f"Продолжительность: {session['duration']} минут", color=MUTED),
-                text(
-                    f"Свободно: {session['free_count']} из {session['total_count']} мест",
-                    18,
-                    bold=True,
-                ),
-                *(
-                    [text("Причина отмены: " + session["cancel_reason"], color=RED)]
-                    if session["cancel_reason"]
-                    else []
-                ),
-                ft.Row(actions, wrap=True),
-            ),
-        )
+        self.session_form(session_id)
 
     def cancel_session(self, session):
         def cancel(reason):
@@ -572,11 +487,15 @@ class AdminUI:
         if not events or not halls:
             raise AppError("Для создания сеанса сначала создайте мероприятие и зал.")
         session = self.service.get_session(session_id) if session_id else {}
+        editable = not session_id or (
+            session["status"] == "available" and session["start"] > datetime.now()
+        )
+        if not editable:
+            saved = {}
         current_event = int(
             saved.get("event_id") or session.get("event_id", event_id or events[0]["id"])
         )
         current_hall = int(saved.get("hall_id") or session.get("hall_id", halls[0]["id"]))
-        hall = self.service.get_hall(current_hall)
         event_select = select(
             "Мероприятие", [(e["id"], e["title"]) for e in events], str(current_event)
         )
@@ -585,17 +504,14 @@ class AdminUI:
             "start", (datetime.now() + timedelta(days=1)).replace(hour=19, minute=0)
         )
         date = self.app.date_field(
-            "Дата · ДД.ММ.ГГГГ", saved.get("date", start.strftime("%d.%m.%Y")), width=245
+            "Дата · ДД.ММ.ГГГГ",
+            saved.get("date", start.strftime("%d.%m.%Y")),
+            width=245,
+            required=True,
         )
         time = field("Время · ЧЧ:ММ", saved.get("time", start.strftime("%H:%M")), width=245)
-        prices = self.price_fields(session.get("category_prices", hall["category_prices"]))
-        for category, value in saved.get("prices", {}).items():
-            prices[category].value = value
-        change_prices = ft.Checkbox(
-            label="Изменить цены категорий в этом сеансе",
-            value=saved.get("change_prices", not bool(session_id)),
-        )
-        category_row = ft.Row(list(prices.values()), wrap=True, visible=change_prices.value)
+        for control in (event_select, hall_select, date, time):
+            control.disabled = not editable
 
         def capture():
             self.drafts[draft_key] = {
@@ -603,8 +519,6 @@ class AdminUI:
                 "hall_id": hall_select.value,
                 "date": date.value,
                 "time": time.value,
-                "change_prices": change_prices.value,
-                "prices": {category: control.value for category, control in prices.items()},
             }
 
         def pick_time(_):
@@ -637,36 +551,20 @@ class AdminUI:
             on_click=self.app.safe(pick_time),
         )
 
-        def change_hall(_):
-            selected_hall = self.service.get_hall(int(hall_select.value))
-            for category, control in prices.items():
-                control.value = f"{selected_hall['category_prices'][category] / 100:.2f}"
-            self.page.update()
-
-        def toggle_prices(_):
-            category_row.visible = bool(change_prices.value)
-            self.page.update()
-
-        hall_select.on_select = self.app.safe(change_hall)
-        change_prices.on_change = self.app.safe(toggle_prices)
-
         def save(_):
-            starts = datetime.strptime(
-                date.value.strip() + " " + time.value.strip(), "%d.%m.%Y %H:%M"
+            starts = datetime.combine(
+                date.read(), datetime.strptime(time.value.strip(), "%H:%M").time()
             )
             sid = self.service.save_session(
                 int(event_select.value),
                 int(hall_select.value),
                 starts,
-                self.read_prices(prices) if change_prices.value else None,
                 session_id=session_id,
             )
             self.app.clear_capture()
             self.drafts.pop(draft_key, None)
             self.show("Сеансы", focus_session_id=sid)
-            self.app.notice(
-                "Сеанс сохранён. Индивидуальные цены можно настроить кнопкой «Цены мест»."
-            )
+            self.app.notice("Сеанс сохранён.")
             return sid
 
         self.app.set_view(
@@ -676,24 +574,28 @@ class AdminUI:
                 "session_id": session_id,
                 "event_id": event_id,
             },
-            capture=capture,
+            capture=capture if editable else None,
         )
         self.app.show(
             self.app.button(
                 "К сеансам", lambda _: self.show("Сеансы"), icon=ft.Icons.ARROW_BACK, secondary=True
             ),
             self.app.heading(
-                "Редактировать сеанс" if session_id else "Новый сеанс",
-                f"Сеанс №{session_id}" if session_id else "Выберите мероприятие, зал и время",
+                "Редактировать сеанс"
+                if session_id and editable
+                else "Сеанс"
+                if session_id
+                else "Новый сеанс",
+                f"Сеанс №{session_id} · {session['title']} · {date_text(session['start'])} · {session['hall_name']}"
+                if session_id
+                else "Выберите мероприятие, зал и время",
             ),
             panel(
                 event_select,
                 hall_select,
                 ft.Row([date, time], wrap=True),
-                change_prices,
-                category_row,
                 text(
-                    "При создании копируются цены и индивидуальные переопределения зала. Изменения шаблона зала не меняют цены сеанса.",
+                    "Цены категорий задаются в зале. Новый сеанс получает цены выбранного зала; существующие сеансы сохраняют цены на момент создания.",
                     12,
                     MUTED,
                 ),
@@ -702,112 +604,47 @@ class AdminUI:
                     12,
                     MUTED,
                 ),
-                self.app.button("Сохранить сеанс", save),
-                width=740,
-            ),
-        )
-
-    def session_prices(self, session_id):
-        session = self.service.get_session(session_id)
-        seats = self.service.seat_map(session_id)
-        fields = self.price_fields(session["category_prices"])
-        override = {}
-        summary = text("Индивидуальные изменения: 0", color=MUTED)
-        grid = ft.Column(spacing=8)
-        rows = defaultdict(list)
-        for seat in seats:
-            rows[seat["row"]].append(seat)
-
-        def edit(seat):
-            current = override.get(seat["id"], seat.get("price_override"))
-            value = field(
-                "Цена места, ₽",
-                "" if current is None else f"{current / 100:.2f}",
-                helper="Оставьте пустым, чтобы применить цену категории",
-            )
-
-            def apply(_):
-                override[seat["id"]] = rubles(value.value) if value.value.strip() else None
-                summary.value = f"Индивидуальные изменения: {len(override)}"
-                self.page.pop_dialog()
-                self.page.update()
-
-            self.app.dialog(
-                f"Ряд {seat['row']} · место {seat['number']}",
-                [
-                    value,
-                    text(
-                        "Новая цена действует для будущих бронирований. Стоимость уже подтверждённых билетов сохраняется.",
-                        12,
-                        MUTED,
-                    ),
-                ],
-                [
-                    self.app.button("Назад", lambda _: self.page.pop_dialog(), secondary=True),
-                    self.app.button("Применить", apply),
-                ],
-                width=380,
-            )
-
-        for row, items in sorted(rows.items()):
-            grid.controls.append(
+                *(
+                    [self.app.button("Сохранить сеанс", save)]
+                    if editable
+                    else [
+                        tag("Отменён" if session["status"] == "cancelled" else "Завершён", RED),
+                        text("Этот сеанс доступен только для просмотра.", color=MUTED),
+                        *(
+                            [text("Причина отмены: " + session["cancel_reason"], color=RED)]
+                            if session["cancel_reason"]
+                            else []
+                        ),
+                    ]
+                ),
                 ft.Row(
                     [
-                        text(f"Ряд {row}", 12, MUTED, width=50),
-                        *[
-                            hoverable(
-                                ft.Container(
-                                    text(f"{s['number']}\n{money(s['price'])}", 10, bold=True),
-                                    width=68,
-                                    height=48,
-                                    alignment=ft.Alignment.CENTER,
-                                    bgcolor=CATEGORY_COLORS[s["category"]],
-                                    border_radius=8,
-                                    on_click=self.app.safe(lambda _, seat=s: edit(seat)),
+                        self.app.button(
+                            "К мероприятию",
+                            lambda _: self.event_form(int(event_select.value)),
+                            secondary=True,
+                        ),
+                        self.app.button(
+                            "К залу",
+                            lambda _: self.hall_form(int(hall_select.value)),
+                            secondary=True,
+                        ),
+                        *(
+                            [
+                                self.app.button(
+                                    "Заполненность и места",
+                                    lambda _: self.app.seats(session_id, True),
+                                    secondary=True,
                                 )
-                            )
-                            for s in items
-                        ],
+                            ]
+                            if session_id
+                            else []
+                        ),
                     ],
-                    spacing=6,
-                )
-            )
-        apply_categories = ft.Checkbox(
-            label="Изменить цены категорий (индивидуальные цены сохранятся)", value=False
-        )
-
-        def save(_):
-            if not apply_categories.value and not override:
-                raise AppError(
-                    "Выберите место для изменения цены или включите пересчёт по категориям."
-                )
-            category_prices = (
-                self.read_prices(fields) if apply_categories.value else session["category_prices"]
-            )
-            self.service.set_session_prices(session_id, category_prices, override)
-            self.page.pop_dialog()
-            self.show("Сеансы")
-            self.app.notice("Цены обновлены. Подтверждённые билеты сохраняют прежнюю стоимость.")
-
-        self.app.dialog(
-            "Цены сеанса · " + session["title"],
-            [
-                text("Нажмите место, чтобы задать индивидуальную цену.", color=MUTED),
-                ft.Row([grid], scroll=ft.ScrollMode.ALWAYS),
-                summary,
-                apply_categories,
-                ft.Row(list(fields.values()), wrap=True),
-                text(
-                    "Индивидуальная цена всегда имеет приоритет. Чтобы убрать её, очистите поле цены конкретного места.",
-                    12,
-                    MUTED,
+                    wrap=True,
                 ),
-            ],
-            [
-                self.app.button("Назад", lambda _: self.page.pop_dialog(), secondary=True),
-                self.app.button("Сохранить цены", save),
-            ],
-            width=760,
+                width=740,
+            ),
         )
 
     def halls(self):
@@ -883,9 +720,10 @@ class AdminUI:
 
         HallEditor(self, hall_id).show()
 
-    def statistics(self):
-        saved = self.drafts.get("admin:statistics_filters", {})
+    def bookings(self):
+        saved = self.drafts.get("admin:booking_filters", {})
         sessions = self.service.list_sessions(admin=True)
+        search = field("Поиск по номеру, имени или логину", saved.get("search", ""), width=300)
         event = select(
             "Мероприятие",
             [
@@ -893,7 +731,7 @@ class AdminUI:
                 *[(e["id"], e["title"]) for e in self.service.list_events(admin=True)],
             ],
             saved.get("event_id", ""),
-            width=310,
+            width=290,
         )
         hall = select(
             "Зал",
@@ -911,7 +749,7 @@ class AdminUI:
                 ("completed", "Завершённые"),
                 ("cancelled", "Отменённые"),
             ],
-            saved.get("session_status", "upcoming"),
+            saved.get("session_status", "all"),
             width=245,
         )
         booking_status = select(
@@ -923,7 +761,7 @@ class AdminUI:
                 ("completed", "Завершённые"),
                 ("cancelled", "Отменённые"),
             ],
-            saved.get("booking_status", "valid"),
+            saved.get("booking_status", "all"),
             width=245,
         )
         selector = select(
@@ -939,12 +777,14 @@ class AdminUI:
                 ],
             ],
             saved.get("session_id", ""),
-            width=650,
+            width=430,
         )
         result = ft.Column(spacing=18)
+        listing = ft.Column(spacing=18)
 
         def capture():
-            self.drafts["admin:statistics_filters"] = {
+            self.drafts["admin:booking_filters"] = {
+                "search": search.value.strip(),
                 "event_id": event.value or "",
                 "hall_id": hall.value or "",
                 "date_from": date_from.value.strip(),
@@ -956,81 +796,85 @@ class AdminUI:
 
         def refresh(_=None, *, current=True):
             capture()
-            filters = (
-                self.drafts["admin:statistics_filters"]
-                if current
-                else self.drafts.get("admin:statistics_applied", {})
-            )
-            data = self.service.statistics(
-                int(filters["session_id"]) if filters.get("session_id") else None,
-                event_id=int(filters["event_id"]) if filters.get("event_id") else None,
-                hall_id=int(filters["hall_id"]) if filters.get("hall_id") else None,
-                date_from=self.parse_date(filters.get("date_from", "")),
-                date_to=self.parse_date(filters.get("date_to", "")),
-                session_status=filters.get("session_status", "upcoming"),
-                booking_status=filters.get("booking_status", "valid"),
-            )
             if current:
-                self.drafts["admin:statistics_applied"] = dict(filters)
+                date_from.read()
+                date_to.read()
+            filters = (
+                self.drafts["admin:booking_filters"]
+                if current
+                else self.drafts.get("admin:booking_applied", {})
+            )
+            query = self.booking_query(filters)
+            data = self.service.statistics(**query)
+            bookings = self.service.list_bookings(admin=True, **query)
+            if current:
+                self.drafts["admin:booking_applied"] = dict(filters)
             result.controls = [
                 ft.Row(
                     [
-                        panel(text(label, 13, MUTED), text(value, 30, bold=True), width=235)
+                        panel(
+                            text(label, 13, MUTED),
+                            text(value, 28, bold=True),
+                            width=220,
+                            padding=16,
+                        )
                         for label, value in [
                             ("Бронирований по фильтру", str(data["booking_count"])),
                             ("Билетов по фильтру", str(data["ticket_count"])),
-                            ("Заполненность", f"{data['occupancy_percent']:.1f}%"),
+                            ("Заполненность сеансов", f"{data['occupancy_percent']:.1f}%"),
                             ("Сумма по фильтру", money(data["amount"])),
                         ]
                     ],
                     wrap=True,
                     spacing=16,
                 ),
-                panel(
-                    text("Заполненность сеансов", 20, bold=True),
-                    text(
-                        f"Сеансов: {data['session_count']} · мест: {data['total_seats']} · занято: {data['active_tickets']}",
-                        color=MUTED,
-                    ),
-                    ft.ProgressBar(
-                        value=min(1, data["occupancy_percent"] / 100),
-                        color=TEAL,
-                        bgcolor=BG,
-                        height=10,
-                    ),
-                    text(
-                        "Заполненность отражает занятые места без отменённых билетов. Фильтр состояния брони влияет на количество и сумму выше.",
-                        13,
-                        MUTED,
-                    ),
-                    text(
-                        "Сумма бронирований не является выручкой: приложение не принимает и не учитывает оплату.",
-                        13,
-                        MUTED,
-                    ),
+                text(
+                    f"Сеансов: {data['session_count']} · мест: {data['total_seats']} · занято: {data['active_tickets']}",
+                    color=MUTED,
+                ),
+                text(
+                    "Заполненность — по выбранным сеансам без отменённых билетов; поиск и статус брони меняют список, количество и сумму. Сумма бронирований не означает оплату.",
+                    12,
+                    MUTED,
+                ),
+            ]
+            listing.controls = [
+                text(f"Найдено бронирований: {len(bookings)}", 20, bold=True),
+                *[self.booking_card(booking) for booking in bookings],
+                *(
+                    []
+                    if bookings
+                    else [
+                        self.app.empty(
+                            "Бронирования не найдены",
+                            "Измените фильтры или дождитесь новых бронирований.",
+                        )
+                    ]
                 ),
             ]
             self.page.update()
 
         def reset(_):
             self.app.clear_capture()
-            self.drafts.pop("admin:statistics_filters", None)
-            self.drafts.pop("admin:statistics_applied", None)
-            self.show("Статистика")
+            self.drafts.pop("admin:booking_filters", None)
+            self.drafts.pop("admin:booking_applied", None)
+            self.show("Бронирования")
 
         self.app.set_view(
-            {"section": "Администрирование", "page": "list", "tab": "Статистика"},
+            {"section": "Администрирование", "page": "list", "tab": "Бронирования"},
             capture=capture,
         )
+        search.on_submit = self.app.safe(refresh)
         refresh(current=False)
         return [
+            result,
             panel(
-                ft.Row([event, hall], wrap=True),
-                selector,
-                ft.Row([date_from, date_to], wrap=True),
-                ft.Row([session_status, booking_status], wrap=True),
+                ft.Row([search, event, hall], wrap=True),
+                ft.Row([selector, date_from, date_to], wrap=True),
                 ft.Row(
                     [
+                        session_status,
+                        booking_status,
                         self.app.button("Применить фильтры", refresh),
                         self.app.button("Сбросить", reset, secondary=True),
                     ],
@@ -1042,5 +886,88 @@ class AdminUI:
                     MUTED,
                 ),
             ),
-            result,
+            listing,
         ]
+
+    def booking_query(self, filters):
+        return {
+            "search": filters.get("search", ""),
+            "session_id": int(filters["session_id"]) if filters.get("session_id") else None,
+            "event_id": int(filters["event_id"]) if filters.get("event_id") else None,
+            "hall_id": int(filters["hall_id"]) if filters.get("hall_id") else None,
+            "date_from": self.parse_date(filters.get("date_from", "")),
+            "date_to": self.parse_date(filters.get("date_to", "")),
+            "session_status": filters.get("session_status", "all"),
+            "booking_status": filters.get("booking_status", "all"),
+        }
+
+    def booking_card(self, booking):
+        def return_to_list():
+            self.show("Бронирования")
+
+        def cancel(reason):
+            self.service.cancel_booking(booking["id"], reason)
+            self.show("Бронирования")
+
+        actions = [
+            self.app.button(
+                "Электронный билет", lambda _: self.app.ticket(booking["id"]), secondary=True
+            ),
+            self.app.button(
+                "Места на схеме", lambda _: self.app.booking_map(booking["id"]), secondary=True
+            ),
+            self.app.button(
+                "К сеансу", lambda _: self.session_form(booking["session_id"]), secondary=True
+            ),
+            self.app.button(
+                "К мероприятию",
+                lambda _: self.app.event_detail(
+                    booking["event_id"], related=True, back=("К бронированиям", return_to_list)
+                ),
+                secondary=True,
+            ),
+        ]
+        if booking["status"] == "active" and booking["start"] > datetime.now():
+            actions.append(
+                self.app.button(
+                    "Отменить",
+                    lambda _: self.app.confirm(
+                        "Отменить бронирование?",
+                        f"Бронирование {booking['number']}. Все места этого заказа будут освобождены.",
+                        cancel,
+                        reason=True,
+                    ),
+                    secondary=True,
+                )
+            )
+        return panel(
+            ft.Row(
+                [
+                    tag(
+                        {"active": "Активно", "cancelled": "Отменено", "completed": "Завершено"}[
+                            booking["status"]
+                        ],
+                        RED if booking["status"] == "cancelled" else TEAL,
+                        "#F8E9E9" if booking["status"] == "cancelled" else "#E7F3F2",
+                    ),
+                    text(booking["number"], 13, MUTED, selectable=True),
+                    ft.Container(expand=True),
+                    text(money(booking["total"]), 20, bold=True),
+                ],
+                wrap=True,
+            ),
+            text(booking["title"], 22, bold=True),
+            text(
+                f"{date_text(booking['start'])} · {booking['hall_name']} · сеанс №{booking['session_id']}",
+                color=MUTED,
+            ),
+            text(f"Владелец: {booking['user_name']} · @{booking['user_login']}", color=MUTED),
+            text(" · ".join(f"ряд {t['row']}, место {t['number']}" for t in booking["tickets"])),
+            *(
+                [text("Причина отмены: " + booking["cancel_reason"], color=RED)]
+                if booking["cancel_reason"]
+                else []
+            ),
+            ft.Row(actions, wrap=True),
+            data={"booking_id": booking["id"]},
+        )

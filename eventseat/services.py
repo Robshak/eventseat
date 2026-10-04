@@ -394,7 +394,6 @@ class Service:
                     "row": s.row,
                     "number": s.number,
                     "category": s.category,
-                    "price_override": s.price_override,
                     "enabled": s.enabled,
                 }
                 for s in self._hall_seats(db, record.id)
@@ -429,12 +428,13 @@ class Service:
                 for number in range(1, columns + 1)
             ]
         try:
+            if any(s.get("price_override") is not None for s in seats):
+                raise AppError("Цены мест задаются только категориями зала.")
             domain_seats = tuple(
                 Seat(
                     s["row"],
                     s["number"],
                     s.get("category", "стандарт"),
-                    s.get("price_override"),
                     bool(s.get("enabled", True)),
                 )
                 for s in seats
@@ -479,7 +479,7 @@ class Service:
                 if item is None:
                     item = SeatRecord(hall_id=record.id, row=seat.row, number=seat.number)
                     db.add(item)
-                item.category, item.price_override = seat.category, seat.price_override
+                item.category, item.price_override = seat.category, None
                 item.enabled, item.in_layout = seat.enabled, True
             db.flush()
             return record.id
@@ -531,7 +531,7 @@ class Service:
         )
 
     def _copy_session_seats(
-        self, db, record: SessionRecord, hall: HallRecord, prices: dict, seat_prices: dict | None
+        self, db, record: SessionRecord, hall: HallRecord, prices: dict
     ) -> None:
         hall_seats = self._hall_seats(db, hall.id)
         record.stage = hall.stage
@@ -539,7 +539,6 @@ class Service:
             {"row": seat.row, "number": seat.number, "enabled": seat.enabled} for seat in hall_seats
         ]
         source = [seat for seat in hall_seats if seat.enabled]
-        overrides = self._seat_price_overrides(seat_prices, {s.id for s in source})
         existing = {
             s.seat_id: s
             for s in db.scalars(
@@ -554,32 +553,11 @@ class Service:
                 item = SessionSeatRecord(session_id=record.id, seat_id=seat.id)
                 db.add(item)
             item.row, item.number, item.category = seat.row, seat.number, seat.category
-            item.price_override = overrides.get(seat.id, seat.price_override)
-            item.price = Seat(seat.row, seat.number, seat.category, item.price_override).price(
-                prices
-            )
+            item.price_override = None
+            item.price = Seat(seat.row, seat.number, seat.category).price(prices)
             item.closed, item.in_layout = False, True
 
-    @staticmethod
-    def _seat_price_overrides(seat_prices, allowed_ids: set[int]) -> dict:
-        if seat_prices is None:
-            return {}
-        if not isinstance(seat_prices, dict):
-            raise AppError("Проверьте индивидуальные цены мест.")
-        result = {}
-        for seat_id, price in seat_prices.items():
-            try:
-                key = int(seat_id)
-            except (TypeError, ValueError) as exc:
-                raise AppError("Неизвестное место в настройке цен.") from exc
-            if key not in allowed_ids:
-                raise AppError("Индивидуальная цена относится к месту другого зала.")
-            result[key] = None if price is None else money(price)
-        return result
-
-    def save_session(
-        self, event_id, hall_id, start, category_prices=None, seat_prices=None, session_id=None
-    ) -> int:
+    def save_session(self, event_id, hall_id, start, *, session_id=None) -> int:
         if not isinstance(start, datetime):
             raise AppError("Укажите корректные дату и время сеанса.")
         if start.tzinfo is not None:
@@ -627,20 +605,12 @@ class Service:
             record.start, record.duration = start, event.duration
             record.status, record.cancel_reason = "available", ""
             new_snapshot = session_id is None or old_hall_id != hall_id
-            prices = self._prices(
-                category_prices
-                if category_prices is not None
-                else hall.category_prices
-                if new_snapshot
-                else record.category_prices
-            )
+            prices = self._prices(hall.category_prices if new_snapshot else record.category_prices)
             record.category_prices = prices
             db.add(record)
             db.flush()
             if new_snapshot:
-                self._copy_session_seats(db, record, hall, prices, seat_prices)
-            elif category_prices is not None or seat_prices is not None:
-                self._update_session_prices(db, record, prices, seat_prices)
+                self._copy_session_seats(db, record, hall, prices)
             return record.id
 
     def _session_dict(self, db, record: SessionRecord) -> dict:
@@ -814,7 +784,6 @@ class Service:
                     "number": seat.number,
                     "category": seat.category,
                     "price": seat.price,
-                    "price_override": seat.price_override,
                     "status": "booked"
                     if seat.seat_id in occupied
                     else "closed"
@@ -823,27 +792,6 @@ class Service:
                 }
                 for seat in self._snapshot_seats(db, session_id)
             ]
-
-    def _update_session_prices(
-        self, db, record: SessionRecord, prices: dict, seat_prices=None
-    ) -> None:
-        seats = self._snapshot_seats(db, record.id)
-        overrides = self._seat_price_overrides(seat_prices, {s.seat_id for s in seats})
-        record.category_prices = prices
-        for item in seats:
-            if item.seat_id in overrides:
-                item.price_override = overrides[item.seat_id]
-            item.price = Seat(item.row, item.number, item.category, item.price_override).price(
-                prices
-            )
-
-    def set_session_prices(self, session_id: int, category_prices: dict, seat_prices=None) -> None:
-        prices = self._prices(category_prices)
-        with self.store.write() as db:
-            self._actor(db, admin=True)
-            record = self._session_record(db, session_id, public=False)
-            self._session_domain(record).require_bookable(self._now())
-            self._update_session_prices(db, record, prices, seat_prices)
 
     def set_seat_closed(self, session_id: int, seat_id: int, closed: bool) -> None:
         with self.store.write() as db:
@@ -1167,21 +1115,74 @@ class Service:
             ],
         }
 
-    def list_bookings(self, search: str = "", admin: bool = False) -> list[dict]:
+    def _filter_bookings(self, db, records, *, search="", status="all"):
+        if status not in {"valid", "all", "active", "completed", "cancelled"}:
+            raise AppError("Неизвестный статус бронирования.")
+        owners = {
+            owner.id: owner
+            for owner in db.scalars(
+                select(UserRecord).where(UserRecord.id.in_({r.user_id for r in records}))
+            )
+        }
+        search = search.strip().casefold()
+        now = self._now()
+        result = []
+        for record in records:
+            actual = (
+                "cancelled"
+                if record.status == "cancelled"
+                else "completed"
+                if record.start <= now
+                else "active"
+            )
+            if not (
+                status == "all" or status == actual or status == "valid" and actual != "cancelled"
+            ):
+                continue
+            owner = owners[record.user_id]
+            if search not in f"{record.number} {owner.name} {owner.login}".casefold():
+                continue
+            result.append(record)
+        return result
+
+    def list_bookings(
+        self,
+        search: str = "",
+        admin: bool = False,
+        *,
+        event_id=None,
+        hall_id=None,
+        session_id=None,
+        date_from=None,
+        date_to=None,
+        session_status="all",
+        booking_status="all",
+    ) -> list[dict]:
         with self.store.read() as db:
             actor = self._actor(db, admin=admin)
-            query = select(BookingRecord).order_by(
-                BookingRecord.created_at.desc(), BookingRecord.id.desc()
+            query = (
+                select(BookingRecord)
+                .join(SessionRecord)
+                .order_by(BookingRecord.created_at.desc(), BookingRecord.id.desc())
+            )
+            query = self._session_filters(
+                query,
+                event_id=event_id,
+                hall_id=hall_id,
+                session_id=session_id,
+                date_from=date_from,
+                date_to=date_to,
+                status=session_status,
             )
             if not admin:
                 query = query.where(BookingRecord.user_id == actor.id)
-            records = [self._booking_dict(db, record) for record in db.scalars(query)]
-            search = search.strip().casefold()
-            return [
-                r
-                for r in records
-                if search in f"{r['number']} {r['user_name']} {r['user_login']}".casefold()
-            ]
+            records = self._filter_bookings(
+                db,
+                list(db.scalars(query)),
+                search=search,
+                status=booking_status,
+            )
+            return [self._booking_dict(db, record) for record in records]
 
     def get_booking(self, booking_id: int) -> dict:
         with self.store.read() as db:
@@ -1250,6 +1251,7 @@ class Service:
         date_to=None,
         session_status="upcoming",
         booking_status="valid",
+        search="",
     ) -> dict:
         """Aggregate selected sessions; dates refer to session starts, amounts are kopecks.
 
@@ -1287,23 +1289,14 @@ class Service:
             bookings = list(
                 db.scalars(select(BookingRecord).where(BookingRecord.session_id.in_(session_ids)))
             )
-            now = self._now()
-            statuses = {
-                record.id: (
-                    "cancelled"
-                    if record.status == "cancelled"
-                    else "completed"
-                    if record.start <= now
-                    else "active"
-                )
-                for record in bookings
-            }
             matching = {
-                booking_id
-                for booking_id, status in statuses.items()
-                if booking_status == "all"
-                or (booking_status == "valid" and status != "cancelled")
-                or status == booking_status
+                record.id
+                for record in self._filter_bookings(
+                    db,
+                    bookings,
+                    search=search,
+                    status=booking_status,
+                )
             }
             all_tickets = list(
                 db.scalars(select(TicketRecord).where(TicketRecord.session_id.in_(session_ids)))
@@ -1388,7 +1381,6 @@ class Service:
                     120,
                     "cinema.png",
                     hall,
-                    prices,
                 ),
                 (
                     "Музыка после заката",
@@ -1397,7 +1389,6 @@ class Service:
                     90,
                     "concert.png",
                     chamber,
-                    {"эконом": 90000, "стандарт": 120000, "VIP": 180000},
                 ),
                 (
                     "Город будущего",
@@ -1406,7 +1397,6 @@ class Service:
                     75,
                     "lecture.png",
                     hall,
-                    {"эконом": 30000, "стандарт": 45000, "VIP": 65000},
                 ),
             ]
             tomorrow = (self._now() + timedelta(days=1)).replace(
@@ -1419,7 +1409,6 @@ class Service:
                 duration,
                 cover,
                 selected_hall,
-                session_prices,
             ) in enumerate(events):
                 event = EventRecord(
                     title=title,
@@ -1437,11 +1426,11 @@ class Service:
                         hall_id=selected_hall.id,
                         start=tomorrow + timedelta(days=day),
                         duration=duration,
-                        category_prices=session_prices,
+                        category_prices=dict(selected_hall.category_prices),
                         status="available",
                     )
                     db.add(session)
                     db.flush()
-                    self._copy_session_seats(db, session, selected_hall, session_prices, None)
+                    self._copy_session_seats(db, session, selected_hall, session.category_prices)
             db.add(SettingRecord(key="demo_seeded", value="1"))
             db.delete(pending)

@@ -14,7 +14,6 @@ def layout():
             "number": number,
             "category": "стандарт",
             "enabled": True,
-            "price_override": 12000 if number == 7 else None,
         }
         for row in (3, 4, 5)
         for number in (5, 6, 7, 8)
@@ -70,22 +69,18 @@ def test_apply_group_retains_unselected_seats_and_unchanged_values(layout):
         if index in selected:
             assert seat["category"] == "VIP"
             assert seat["enabled"] is False
-            assert seat["price_override"] == original[index]["price_override"]
+            assert seat["number"] == original[index]["number"]
         else:
             assert seat == original[index]
-    apply_properties(layout, selected, enabled=True, price_mode="custom", price=45678)
+    apply_properties(layout, selected, enabled=True)
     assert all(layout[index]["enabled"] for index in selected)
-    assert {layout[index]["price_override"] for index in selected} == {45678}
-    apply_properties(layout, selected, price_mode="category")
-    assert all(layout[index]["price_override"] is None for index in selected)
+    assert all(layout[index]["category"] == "VIP" for index in selected)
 
 
 @pytest.mark.parametrize(
     "properties",
     [
         {"category": "неизвестная"},
-        {"price_mode": "custom", "price": -1},
-        {"price_mode": "custom"},
         {"number": 33},
     ],
 )

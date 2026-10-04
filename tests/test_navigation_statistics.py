@@ -204,6 +204,42 @@ def test_empty_statistics_and_invalid_filters(system):
         system["user"].statistics(session_status="all")
 
 
+def test_booking_search_filters_match_statistics_without_changing_session_occupancy(system):
+    first = book(system, count=2)
+    second = book(system, user=system["other"], key="boris-booking")
+    admin = system["admin"]
+    filters = {
+        "event_id": system["event"],
+        "hall_id": system["hall"],
+        "session_id": system["session"],
+        "date_from": system["start"].date(),
+        "date_to": system["start"].date(),
+        "session_status": "upcoming",
+        "booking_status": "active",
+        "search": " ALICE ",
+    }
+    bookings = admin.list_bookings(admin=True, **filters)
+    stats = admin.statistics(**filters)
+    assert [booking["id"] for booking in bookings] == [first["id"]]
+    assert stats["booking_count"] == len(bookings) == 1
+    assert stats["ticket_count"] == 2
+    assert stats["amount"] == first["total"]
+    assert stats["active_tickets"] == 3 and stats["occupancy_percent"] == 50
+    filters["search"] = second["number"].lower()
+    assert admin.list_bookings(admin=True, **filters)[0]["id"] == second["id"]
+    assert system["user"].list_bookings(**filters) == []
+    assert admin.statistics(**filters)["amount"] == second["total"]
+    system["other"].cancel_booking(second["id"])
+    assert admin.list_bookings(admin=True, **filters) == []
+    filters["booking_status"] = "cancelled"
+    assert admin.list_bookings(admin=True, **filters)[0]["id"] == second["id"]
+    assert admin.statistics(**filters)["ticket_count"] == 1
+    filters["search"] = "nobody-matches"
+    empty = admin.statistics(**filters)
+    assert empty["booking_count"] == empty["ticket_count"] == empty["amount"] == 0
+    assert empty["total_seats"] == 6 and empty["active_tickets"] == 2
+
+
 def test_admin_session_filters_and_public_visibility(system, monkeypatch):
     admin, user = system["admin"], system["user"]
     hall = admin.copy_hall(system["hall"], "Другой зал")
