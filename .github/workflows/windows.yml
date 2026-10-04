@@ -48,8 +48,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view v1.0.0 >/dev/null 2>&1; then
-            echo "Release v1.0.0 already exists; keeping its artifacts unchanged."
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "Release v$version already exists; keeping its artifacts unchanged."
           else
-            gh release create v1.0.0 release/EventSeat.exe release/SHA256SUMS.txt --target "$GITHUB_SHA" --title "EventSeat 1.0.0 — Windows x64" --notes-file docs/RELEASE_NOTES.md
+            gh release create "v$version" release/EventSeat.exe release/SHA256SUMS.txt --target "$GITHUB_SHA" --title "EventSeat $version — Windows x64" --notes-file docs/RELEASE_NOTES.md
           fi

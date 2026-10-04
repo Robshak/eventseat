@@ -10,6 +10,8 @@ from uuid import uuid4
 
 import flet as ft
 
+from eventseat import __version__
+from eventseat.account_sessions import AccountSessions
 from eventseat.config import asset_path
 from eventseat.domain import AppError, PriceChanged
 
@@ -58,7 +60,15 @@ def text(value, size=14, color=INK, bold=False, **kwargs):
 
 def field(label, value="", **kwargs):
     return ft.TextField(
-        label=label, value=str(value), filled=True, fill_color=WHITE, text_size=14, **kwargs
+        label=label,
+        value=str(value),
+        filled=True,
+        fill_color=WHITE,
+        hover_color="#F0F8F7",
+        focused_border_color=TEAL,
+        focused_border_width=2,
+        text_size=14,
+        **kwargs,
     )
 
 
@@ -100,10 +110,31 @@ def tag(label, color=TEAL, background="#E7F3F2"):
     )
 
 
+def hoverable(control, background=None):
+    """Highlight interactive surfaces without changing a seat's status colour."""
+    normal_background = control.bgcolor
+    normal_border = control.border or ft.Border.all(1, "#00000000")
+    control.border = normal_border
+    control.ink = True
+    control.ink_color = "#18087F8C"
+    control.animate = ft.Animation(140, ft.AnimationCurve.EASE_OUT)
+
+    def hover(event):
+        active = str(event.data).lower() == "true"
+        control.border = ft.Border.all(2, TEAL) if active else normal_border
+        if background is not None:
+            control.bgcolor = background if active else normal_background
+        control.update()
+
+    control.on_hover = hover
+    return control
+
+
 class App:
     def __init__(self, page, service):
         self.page = page
-        self.service = service
+        self.accounts = AccountSessions(service)
+        self._account_generation = 0
         self.section = "Афиша"
         self.checkout_key = str(uuid4())
         self.busy_checkout = False
@@ -112,14 +143,40 @@ class App:
         self.content = ft.Column(expand=True, spacing=20, scroll=ft.ScrollMode.AUTO)
         self.nav = ft.Column(spacing=7)
 
+    @property
+    def service(self):
+        return self.accounts.current
+
+    def close(self):
+        self.accounts.close()
+
     def start(self):
         self.page.title = "EventSeat — события, которые запомнятся"
         self.page.bgcolor = BG
         self.page.padding = 0
         self.page.spacing = 0
         self.page.theme_mode = ft.ThemeMode.LIGHT
+        link_style = ft.ButtonStyle(
+            color=TEAL,
+            overlay_color={
+                ft.ControlState.HOVERED: "#22087F8C",
+                ft.ControlState.FOCUSED: "#33087F8C",
+                ft.ControlState.PRESSED: "#44087F8C",
+            },
+            side={ft.ControlState.FOCUSED: ft.BorderSide(2, TEAL)},
+            mouse_cursor=ft.MouseCursor.CLICK,
+        )
         self.page.theme = ft.Theme(
-            color_scheme_seed=TEAL, font_family="Segoe UI", use_material3=True, scaffold_bgcolor=BG
+            color_scheme_seed=TEAL,
+            font_family="Segoe UI",
+            use_material3=True,
+            scaffold_bgcolor=BG,
+            text_button_theme=ft.TextButtonTheme(style=link_style),
+            icon_button_theme=ft.IconButtonTheme(style=link_style),
+        )
+        self.page.locale_configuration = ft.LocaleConfiguration(
+            supported_locales=[ft.Locale("ru", "RU"), ft.Locale("en", "US")],
+            current_locale=ft.Locale("ru", "RU"),
         )
         self.page.window.width = 1280
         self.page.window.height = 850
@@ -128,7 +185,11 @@ class App:
         self.auth("setup" if self.service.needs_setup() else "login")
 
     def safe(self, action):
+        generation = self._account_generation
+
         async def callback(e=None):
+            if generation != self._account_generation:
+                return
             try:
                 result = action(e)
                 if inspect.isawaitable(result):
@@ -152,12 +213,31 @@ class App:
 
     def button(self, label, action, icon=None, secondary=False, **kwargs):
         button_type = ft.OutlinedButton if secondary else ft.Button
+        style = ft.ButtonStyle(
+            bgcolor={
+                ft.ControlState.DISABLED: "#E2E7EA",
+                ft.ControlState.HOVERED: "#E4F3F1" if secondary else "#066875",
+                ft.ControlState.FOCUSED: "#D4ECE8" if secondary else "#065B67",
+                ft.ControlState.PRESSED: "#CCE7E2" if secondary else "#044B55",
+                ft.ControlState.DEFAULT: WHITE if secondary else TEAL,
+            },
+            color={
+                ft.ControlState.DISABLED: "#87939E",
+                ft.ControlState.DEFAULT: TEAL if secondary else WHITE,
+            },
+            side={
+                ft.ControlState.FOCUSED: ft.BorderSide(2, INK),
+                ft.ControlState.DEFAULT: ft.BorderSide(1, LINE if secondary else TEAL),
+            },
+            animation_duration=140,
+            mouse_cursor=ft.MouseCursor.CLICK,
+        )
         return button_type(
             content=label,
             icon=icon,
             on_click=self.safe(action),
             height=43,
-            **({} if secondary else {"bgcolor": TEAL, "color": WHITE}),
+            style=style,
             **kwargs,
         )
 
@@ -223,6 +303,9 @@ class App:
         self.page.update()
 
     def auth(self, mode="login"):
+        if self.service.current_user is not None:
+            self.accounts.begin_login()
+            self.reset_account_view()
         setup, register = mode == "setup", mode == "register"
         login = field("Логин", autofocus=True, max_length=64)
         name = field("Отображаемое имя", max_length=100)
@@ -246,9 +329,8 @@ class App:
                 self.service.login(login.value, password.value)
             else:
                 self.service.login(login.value, password.value)
-            self.section = "Афиша"
-            self.shell()
-            self.catalogue()
+            self.accounts.remember_current()
+            self.activate_account()
 
         password.on_submit = self.safe(submit)
         repeat.on_submit = self.safe(submit)
@@ -283,6 +365,15 @@ class App:
                     on_click=self.safe(lambda _: self.auth("login" if register else "register")),
                 )
             ]
+        if self.accounts.can_return:
+            form.append(
+                self.button(
+                    "Вернуться в аккаунт",
+                    lambda _: self.cancel_add_account(),
+                    icon=ft.Icons.ARROW_BACK,
+                    secondary=True,
+                )
+            )
         visual = ft.Container(
             ft.Column(
                 [
@@ -336,26 +427,60 @@ class App:
 
     def shell(self):
         user = self.service.current_user
-        entries = [
-            ("Афиша", ft.Icons.GRID_VIEW_ROUNDED, self.catalogue),
-            ("Корзина", ft.Icons.SHOPPING_BAG_OUTLINED, self.cart),
-            ("Мои бронирования", ft.Icons.CONFIRMATION_NUMBER_OUTLINED, self.bookings),
-            ("Профиль", ft.Icons.PERSON_OUTLINE, self.profile),
-        ]
+        entries = [("Афиша", ft.Icons.GRID_VIEW_ROUNDED, self.catalogue)]
         if user["role"] == "admin":
             entries.append(("Администрирование", ft.Icons.TUNE_ROUNDED, self.admin))
+        else:
+            entries += [
+                ("Корзина", ft.Icons.SHOPPING_BAG_OUTLINED, self.cart),
+                ("Мои бронирования", ft.Icons.CONFIRMATION_NUMBER_OUTLINED, self.bookings),
+            ]
+        entries.append(("Профиль", ft.Icons.PERSON_OUTLINE, self.profile))
         self.nav.controls = [
-            ft.Container(
-                ft.Row([ft.Icon(icon, size=21, color=WHITE), text(label, 13, WHITE)], spacing=13),
-                padding=14,
-                border_radius=10,
-                bgcolor="#28475D" if label == self.section else None,
-                on_click=self.safe(
-                    lambda _, action=action, label=label: self.navigate(label, action)
+            hoverable(
+                ft.Container(
+                    ft.Row(
+                        [ft.Icon(icon, size=21, color=WHITE), text(label, 13, WHITE)], spacing=13
+                    ),
+                    padding=14,
+                    border_radius=10,
+                    bgcolor="#28475D" if label == self.section else NAVY,
+                    on_click=self.safe(
+                        lambda _, action=action, label=label: self.navigate(label, action)
+                    ),
                 ),
+                background="#35566D",
             )
             for label, icon, action in entries
         ]
+        account_selector = ft.Dropdown(
+            label="Аккаунты",
+            value=str(user["id"]),
+            options=[
+                ft.DropdownOption(
+                    key=str(account["id"]),
+                    text=f"@{account['login']} · {account['name']}",
+                    tooltip=f"{account['name']} · @{account['login']}"
+                    + (" · Администратор" if account["role"] == "admin" else " · Пользователь"),
+                )
+                for account in self.accounts.users
+            ],
+            filled=True,
+            fill_color="#203B53",
+            bgcolor=NAVY,
+            color=WHITE,
+            label_style=ft.TextStyle(color="#B9CAD8", size=12),
+            text_size=12,
+            border_color="#476377",
+            focused_border_color="#58D2C6",
+            menu_width=360,
+            menu_height=280,
+            tooltip=f"{user['name']} · @{user['login']}"
+            + (" · Администратор" if user["role"] == "admin" else " · Пользователь"),
+        )
+        account_selector.on_select = self.safe(
+            lambda _: self.switch_account(int(account_selector.value))
+        )
         sidebar = ft.Container(
             ft.Column(
                 [
@@ -370,28 +495,28 @@ class App:
                     ft.Container(height=24),
                     self.nav,
                     ft.Container(expand=True),
-                    ft.Container(
-                        ft.Column(
-                            [
-                                text(user["name"], 14, WHITE, True, max_lines=2),
-                                text(
-                                    "Администратор"
-                                    if user["role"] == "admin"
-                                    else "Личный кабинет",
-                                    12,
-                                    "#8FA9BB",
-                                ),
-                            ]
-                        ),
-                        padding=12,
+                    text(
+                        user["name"],
+                        14,
+                        WHITE,
+                        True,
+                        max_lines=1,
+                        overflow=ft.TextOverflow.ELLIPSIS,
                     ),
+                    account_selector,
                     ft.TextButton(
-                        "Выйти из аккаунта",
-                        icon=ft.Icons.LOGOUT,
-                        on_click=self.safe(lambda _: self.logout()),
-                        style=ft.ButtonStyle(color="#C4D6E2"),
+                        "Добавить аккаунт",
+                        icon=ft.Icons.PERSON_ADD_ALT_1,
+                        on_click=self.safe(lambda _: self.add_account()),
+                        style=ft.ButtonStyle(
+                            color="#C4D6E2",
+                            overlay_color={
+                                ft.ControlState.HOVERED: "#35566D",
+                                ft.ControlState.FOCUSED: "#35566D",
+                            },
+                        ),
                     ),
-                    text("v1.0 · Локальное приложение", 10, "#8FA9BB"),
+                    text(f"v{__version__} · Локальное приложение", 10, "#8FA9BB"),
                 ],
                 spacing=10,
                 expand=True,
@@ -416,9 +541,40 @@ class App:
         action()
 
     def logout(self):
-        self.service.logout()
+        self.accounts.logout()
+        self.reset_account_view()
+        if self.service.current_user:
+            self.shell()
+            self.catalogue()
+        else:
+            self.auth()
+
+    def reset_account_view(self):
+        self._account_generation += 1
+        while self.page.pop_dialog() is not None:
+            pass
+        self.section = "Афиша"
+        self.content.controls = []
         self.checkout_key = str(uuid4())
+        self.busy_checkout = False
+
+    def activate_account(self):
+        self.reset_account_view()
+        self.shell()
+        self.catalogue()
+
+    def add_account(self):
+        self.accounts.begin_login()
+        self.reset_account_view()
         self.auth()
+
+    def cancel_add_account(self):
+        self.accounts.cancel_login()
+        self.activate_account()
+
+    def switch_account(self, user_id):
+        self.accounts.switch(user_id)
+        self.activate_account()
 
     def cover(self, cover_path, width=270, height=174):
         fallback = ft.Container(
@@ -447,67 +603,121 @@ class App:
             border_radius=12,
         )
 
-    def catalogue(self, search="", category="", day=""):
-        search_field = field("Найти событие", search, prefix_icon=ft.Icons.SEARCH, width=285)
+    def catalogue(self, search="", category="", date_from="", date_to=""):
+        search_field = field("Найти событие", search, prefix_icon=ft.Icons.SEARCH, width=230)
         category_field = select(
-            "Категория", [("", "Все категории"), *CATEGORIES], category, width=200
+            "Категория", [("", "Все категории"), *CATEGORIES], category, width=165
         )
-        date_field = field("Дата · ДД.ММ.ГГГГ", day, width=200)
+        from_field = field("С · ДД.ММ.ГГГГ", date_from, width=200)
+        to_field = field("По · ДД.ММ.ГГГГ", date_to, width=200)
+
+        def calendar(target, label):
+            selected = datetime.strptime(target.value, "%d.%m.%Y") if target.value else None
+
+            def changed(event):
+                if event.control.value:
+                    target.value = event.control.value.strftime("%d.%m.%Y")
+                    target.update()
+
+            self.page.show_dialog(
+                ft.DatePicker(
+                    value=selected,
+                    first_date=datetime(2000, 1, 1),
+                    last_date=datetime(2100, 12, 31),
+                    help_text=label,
+                    cancel_text="Отмена",
+                    confirm_text="Выбрать",
+                    field_label_text="Дата",
+                    field_hint_text="ДД.ММ.ГГГГ",
+                    on_change=self.safe(changed),
+                )
+            )
+
+        for date_field, label in [
+            (from_field, "Выбрать начальную дату"),
+            (to_field, "Выбрать конечную дату"),
+        ]:
+            date_field.suffix_icon = ft.IconButton(
+                icon=ft.Icons.CALENDAR_MONTH_OUTLINED,
+                tooltip=label,
+                on_click=self.safe(
+                    lambda _, target=date_field, label=label: calendar(target, label)
+                ),
+            )
 
         def apply(_):
             self.catalogue(
-                search_field.value.strip(), category_field.value or "", date_field.value.strip()
+                search_field.value.strip(),
+                category_field.value or "",
+                from_field.value.strip(),
+                to_field.value.strip(),
             )
 
         search_field.on_submit = self.safe(apply)
-        date_field.on_submit = self.safe(apply)
-        date_filter = datetime.strptime(day, "%d.%m.%Y").date() if day else None
-        events = self.service.list_events(search, category, date_filter)
+        from_field.on_submit = self.safe(apply)
+        to_field.on_submit = self.safe(apply)
+        events = self.service.list_events(
+            search,
+            category,
+            date_from=datetime.strptime(date_from, "%d.%m.%Y").date() if date_from else None,
+            date_to=datetime.strptime(date_to, "%d.%m.%Y").date() if date_to else None,
+        )
         cards = []
         for event in events:
             cards.append(
-                ft.Container(
-                    ft.Column(
-                        [
-                            self.cover(event.get("cover_path", "")),
-                            ft.Container(
-                                ft.Column(
-                                    [
-                                        tag(event["category"].upper()),
-                                        text(
-                                            event["title"],
-                                            20,
-                                            bold=True,
-                                            max_lines=2,
-                                            overflow=ft.TextOverflow.ELLIPSIS,
-                                        ),
-                                        text(date_text(event.get("next_start")), 13, MUTED),
-                                        ft.Row(
-                                            [
-                                                text(
-                                                    "от " + money(event.get("min_price") or 0),
-                                                    16,
-                                                    bold=True,
-                                                ),
-                                                ft.Container(expand=True),
-                                                ft.Icon(
-                                                    ft.Icons.ARROW_FORWARD, color=TEAL, size=20
-                                                ),
-                                            ]
-                                        ),
-                                    ],
-                                    spacing=12,
+                hoverable(
+                    ft.Container(
+                        ft.Column(
+                            [
+                                self.cover(event.get("cover_path", "")),
+                                ft.Container(
+                                    ft.Column(
+                                        [
+                                            tag(event["category"].upper()),
+                                            text(
+                                                event["title"],
+                                                20,
+                                                bold=True,
+                                                max_lines=2,
+                                                overflow=ft.TextOverflow.ELLIPSIS,
+                                            ),
+                                            text(date_text(event.get("next_start")), 13, MUTED),
+                                            ft.Row(
+                                                [
+                                                    text(
+                                                        "от " + money(event.get("min_price") or 0),
+                                                        16,
+                                                        bold=True,
+                                                    ),
+                                                    ft.Container(expand=True),
+                                                    ft.Icon(
+                                                        ft.Icons.ARROW_FORWARD, color=TEAL, size=20
+                                                    ),
+                                                ]
+                                            ),
+                                        ],
+                                        spacing=12,
+                                    ),
+                                    padding=ft.Padding.only(left=16, right=16, bottom=18),
                                 ),
-                                padding=ft.Padding.only(left=16, right=16, bottom=18),
-                            ),
-                        ],
-                        spacing=15,
+                            ],
+                            spacing=15,
+                        ),
+                        width=270,
+                        bgcolor=WHITE,
+                        border_radius=16,
+                        border=ft.Border.all(1, LINE),
+                        on_click=self.safe(
+                            lambda _, eid=event["id"]: self.event_detail(
+                                eid,
+                                back=(
+                                    "К афише",
+                                    lambda: self.catalogue(search, category, date_from, date_to),
+                                ),
+                            )
+                        ),
                     ),
-                    width=270,
-                    bgcolor=WHITE,
-                    border_radius=16,
-                    border=ft.Border.all(1, LINE),
-                    on_click=self.safe(lambda _, eid=event["id"]: self.event_detail(eid)),
+                    background="#F1F9F8",
                 )
             )
         banner = ft.Container(
@@ -533,8 +743,16 @@ class App:
             self.heading("Афиша", "Откройте для себя следующее событие"),
             banner,
             ft.Row(
-                [search_field, category_field, date_field, self.button("Найти", apply)], wrap=True
+                [
+                    search_field,
+                    category_field,
+                    from_field,
+                    to_field,
+                    self.button("Найти", apply, width=89),
+                ],
+                wrap=True,
             ),
+            text("Период включает обе даты. Можно указать только начало или конец.", 12, MUTED),
             ft.Row(
                 [
                     text(f"Событий: {len(events)}", 15, bold=True),
@@ -548,12 +766,18 @@ class App:
             else self.empty("Пока нет событий", "Измените фильтры или вернитесь позже."),
         )
 
-    def event_detail(self, event_id):
-        event = self.service.get_event(event_id)
-        sessions = self.service.list_sessions(event_id)
+    def event_detail(self, event_id, related=False, back=None):
+        event = (
+            self.service.get_related_event(event_id)
+            if related
+            else self.service.get_event(event_id)
+        )
+        sessions = self.service.list_sessions(event_id) if event["published"] else []
+        preview = self.service.current_user["role"] == "admin"
+        back_label, back_action = back or ("К афише", self.catalogue)
         controls = [
             self.button(
-                "К афише", lambda _: self.catalogue(), icon=ft.Icons.ARROW_BACK, secondary=True
+                back_label, lambda _: back_action(), icon=ft.Icons.ARROW_BACK, secondary=True
             ),
             ft.Row(
                 [
@@ -561,6 +785,11 @@ class App:
                     ft.Column(
                         [
                             tag(event["category"].upper()),
+                            *(
+                                []
+                                if event["published"]
+                                else [tag("Снято с публикации", RED, "#F8E9E9")]
+                            ),
                             text(event["title"], 30, bold=True),
                             text(f"{event['duration']} минут", color=MUTED),
                             text(event["description"], 15),
@@ -572,8 +801,10 @@ class App:
                 spacing=28,
                 vertical_alignment=ft.CrossAxisAlignment.START,
             ),
-            text("Выберите сеанс", 23, bold=True),
+            text("Просмотр сеансов" if preview else "Выберите сеанс", 23, bold=True),
         ]
+        if preview:
+            controls.append(text("Режим администратора: просмотр без бронирования.", color=MUTED))
         for session in sessions:
             controls.append(
                 panel(
@@ -591,9 +822,9 @@ class App:
                             ),
                             text("от " + money(session.get("min_price") or 0), 17, bold=True),
                             self.button(
-                                "Выбрать места",
+                                "Посмотреть места" if preview else "Выбрать места",
                                 lambda _, sid=session["id"]: self.seats(sid),
-                                disabled=session["free_count"] == 0,
+                                disabled=not preview and session["free_count"] == 0,
                             ),
                         ]
                     )
@@ -602,12 +833,21 @@ class App:
         if not sessions:
             controls.append(
                 self.empty(
-                    "Нет доступных сеансов", "Новые даты появятся после публикации расписания."
+                    "Мероприятие снято с публикации"
+                    if not event["published"]
+                    else "Нет доступных сеансов",
+                    "Сведения о событии и ваши электронные билеты сохранены. Новые бронирования недоступны."
+                    if not event["published"]
+                    else "Новые даты появятся после публикации расписания.",
                 )
             )
         self.show(*controls)
 
     def seats(self, session_id, admin=False):
+        is_admin = self.service.current_user["role"] == "admin"
+        if admin and not is_admin:
+            raise AppError("Управление местами доступно только администратору.")
+        preview = is_admin and not admin
         session = self.service.get_session(session_id)
         seats = self.service.seat_map(session_id)
         selected = set()
@@ -643,6 +883,8 @@ class App:
             self.page.update()
 
         def toggle(seat):
+            if preview:
+                return
             if admin:
                 if seat["status"] == "booked":
                     raise AppError(
@@ -677,8 +919,12 @@ class App:
                     alignment=ft.Alignment.CENTER,
                     bgcolor=self.seat_color(seat),
                     tooltip=f"Ряд {row}, место {number} · {seat['category']} · {money(seat['price'])}",
-                    on_click=self.safe(lambda _, s=seat: toggle(s)),
+                    on_click=self.safe(lambda _, s=seat: toggle(s))
+                    if not preview and (admin or seat["status"] == "free")
+                    else None,
                 )
+                if cell.on_click:
+                    hoverable(cell)
                 cells[seat["id"]] = cell
                 row_cells.append(cell)
             grid_rows.append(ft.Row(row_cells, spacing=7))
@@ -728,7 +974,11 @@ class App:
             col={"sm": 12, "lg": 8},
         )
         sidebar = panel(
-            text("Управление местами" if admin else "Ваш выбор", 20, bold=True),
+            text(
+                "Управление местами" if admin else "Просмотр схемы" if preview else "Ваш выбор",
+                20,
+                bold=True,
+            ),
             *(
                 [
                     text(
@@ -742,6 +992,23 @@ class App:
                     ),
                 ]
                 if admin
+                else [
+                    text(
+                        "Администратор может просматривать схему без выбора и бронирования мест.",
+                        color=MUTED,
+                    ),
+                    text(
+                        f"Свободно: {session['free_count']} / {session['total_count']}",
+                        18,
+                        bold=True,
+                    ),
+                    self.button(
+                        "Управление сеансами",
+                        lambda _: self.navigate("Администрирование", lambda: self.admin("Сеансы")),
+                        secondary=True,
+                    ),
+                ]
+                if preview
                 else [
                     tariff,
                     text("Учебная скидка 20%. Подтверждение льготы не требуется.", 12, MUTED),
@@ -770,7 +1037,7 @@ class App:
             ),
             ft.ResponsiveRow([grid, sidebar], spacing=20, run_spacing=20),
         )
-        if not admin:
+        if not admin and not preview:
             repaint()
 
     @staticmethod
@@ -780,6 +1047,9 @@ class App:
         )
 
     def cart(self):
+        if self.service.current_user["role"] == "admin":
+            self.navigate("Афиша", self.catalogue)
+            return
         items = self.service.get_cart()
         groups = defaultdict(list)
         for item in items:
@@ -825,9 +1095,17 @@ class App:
             ]
             controls.append(
                 panel(
-                    text(first["title"], 21, bold=True),
+                    self.event_link(first["title"], first["event_id"], ("К корзине", self.cart)),
                     text(f"{date_text(first['start'])} · {first['hall_name']}", color=MUTED),
                     *rows,
+                    self.button(
+                        "К мероприятию",
+                        lambda _, eid=first["event_id"]: self.event_detail(
+                            eid, related=True, back=("К корзине", self.cart)
+                        ),
+                        icon=ft.Icons.ARROW_FORWARD,
+                        secondary=True,
+                    ),
                 )
             )
         if items:
@@ -897,6 +1175,7 @@ class App:
         self.notice(f"Бронирование подтверждено. Оформлено заказов: {len(result)}.")
 
     def bookings(self, admin=False, search=""):
+        admin = admin or self.service.current_user["role"] == "admin"
         bookings = self.service.list_bookings(search=search, admin=admin)
         controls = [
             self.heading(
@@ -906,20 +1185,39 @@ class App:
         ]
         if admin:
             query = field("Поиск по номеру, имени или логину", search, width=420)
-            query.on_submit = self.safe(lambda _: self.bookings(True, query.value))
+            query.on_submit = self.safe(lambda _: self.admin("Бронирования", query.value))
             controls.append(
-                ft.Row([query, self.button("Найти", lambda _: self.bookings(True, query.value))])
+                ft.Row(
+                    [query, self.button("Найти", lambda _: self.admin("Бронирования", query.value))]
+                )
             )
+
+        def return_to_bookings():
+            if admin:
+                self.admin("Бронирования", search)
+            else:
+                self.bookings(False, search)
+
         for booking in bookings:
             status = {"active": "Активно", "cancelled": "Отменено", "completed": "Завершено"}[
                 booking["status"]
             ]
             actions = [
                 self.button(
+                    "К мероприятию",
+                    lambda _, eid=booking["event_id"]: self.event_detail(
+                        eid,
+                        related=True,
+                        back=("К бронированиям", return_to_bookings),
+                    ),
+                    icon=ft.Icons.ARROW_FORWARD,
+                    secondary=True,
+                ),
+                self.button(
                     "Электронный билет",
                     lambda _, bid=booking["id"]: self.ticket(bid),
                     secondary=True,
-                )
+                ),
             ]
             if booking["status"] == "active" and booking["start"] > datetime.now():
                 actions.append(
@@ -948,7 +1246,11 @@ class App:
                             text(money(booking["total"]), 20, bold=True),
                         ]
                     ),
-                    text(booking["title"], 23, bold=True),
+                    self.event_link(
+                        booking["title"],
+                        booking["event_id"],
+                        ("К бронированиям", return_to_bookings),
+                    ),
                     text(f"{date_text(booking['start'])} · {booking['hall_name']}", color=MUTED),
                     text(
                         " · ".join(
@@ -971,9 +1273,20 @@ class App:
             )
         self.show(*controls)
 
+    def event_link(self, title, event_id, back):
+        return ft.TextButton(
+            content=text(title, 22, TEAL, bold=True, text_align=ft.TextAlign.LEFT),
+            tooltip="К мероприятию",
+            style=ft.ButtonStyle(
+                alignment=ft.Alignment.CENTER_LEFT,
+                padding=ft.Padding.symmetric(horizontal=4, vertical=8),
+            ),
+            on_click=self.safe(lambda _: self.event_detail(event_id, related=True, back=back)),
+        )
+
     def cancel_booking(self, booking_id, reason, admin):
         self.service.cancel_booking(booking_id, reason or "Отменено пользователем")
-        self.bookings(admin)
+        self.admin("Бронирования") if admin else self.bookings()
 
     def ticket(self, booking_id):
         booking = self.service.get_booking(booking_id)
@@ -1039,9 +1352,23 @@ class App:
                 self.button("Сохранить изменения", save),
                 width=570,
             ),
+            panel(
+                text("Вход в аккаунт", 19, bold=True),
+                text(
+                    "Переключение слева сохраняет вход до закрытия приложения. Выход удалит этот аккаунт из списка; корзина и бронирования останутся сохранены.",
+                    color=MUTED,
+                ),
+                self.button(
+                    "Выйти из аккаунта",
+                    lambda _: self.logout(),
+                    icon=ft.Icons.LOGOUT,
+                    secondary=True,
+                ),
+                width=570,
+            ),
         )
 
-    def admin(self, tab="Мероприятия"):
+    def admin(self, tab="Мероприятия", search=""):
         from eventseat.ui_admin import AdminUI
 
-        AdminUI(self).show(tab)
+        AdminUI(self).show(tab, search)

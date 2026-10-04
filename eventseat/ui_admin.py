@@ -19,6 +19,7 @@ from eventseat.ui import (
     TEAL,
     date_text,
     field,
+    hoverable,
     money,
     panel,
     rubles,
@@ -34,11 +35,11 @@ class AdminUI:
         self.service = app.service
         self.page = app.page
 
-    def show(self, tab="Мероприятия"):
+    def show(self, tab="Мероприятия", search=""):
         if self.service.current_user["role"] != "admin":
             raise AppError("Это действие доступно только администратору.")
         if tab == "Бронирования":
-            self.app.bookings(True)
+            self.app.bookings(True, search)
             self.app.content.controls.insert(0, self.tabs(tab))
             self.page.update()
             return
@@ -409,14 +410,16 @@ class AdminUI:
                     [
                         text(f"Ряд {row}", 12, MUTED, width=50),
                         *[
-                            ft.Container(
-                                text(f"{s['number']}\n{money(s['price'])}", 10, bold=True),
-                                width=68,
-                                height=48,
-                                alignment=ft.Alignment.CENTER,
-                                bgcolor=CATEGORY_COLORS[s["category"]],
-                                border_radius=8,
-                                on_click=self.app.safe(lambda _, seat=s: edit(seat)),
+                            hoverable(
+                                ft.Container(
+                                    text(f"{s['number']}\n{money(s['price'])}", 10, bold=True),
+                                    width=68,
+                                    height=48,
+                                    alignment=ft.Alignment.CENTER,
+                                    bgcolor=CATEGORY_COLORS[s["category"]],
+                                    border_radius=8,
+                                    on_click=self.app.safe(lambda _, seat=s: edit(seat)),
+                                )
                             )
                             for s in items
                         ],
@@ -566,21 +569,25 @@ class AdminUI:
                         [
                             text(f"Ряд {row}", 12, MUTED, width=60),
                             *[
-                                ft.Container(
-                                    text(s["number"] if s["enabled"] else "·", 12, bold=True),
-                                    width=39,
-                                    height=36,
-                                    alignment=ft.Alignment.CENTER,
-                                    border_radius=8,
-                                    bgcolor=CATEGORY_COLORS[s["category"]] if s["enabled"] else BG,
-                                    border=ft.Border.all(1, LINE),
-                                    tooltip=f"Ряд {s['row']}, место {s['number']} · {s['category']}"
-                                    + (
-                                        f" · {money(s['price_override'])}"
-                                        if s.get("price_override") is not None
-                                        else ""
-                                    ),
-                                    on_click=self.app.safe(lambda _, seat=s: click(seat)),
+                                hoverable(
+                                    ft.Container(
+                                        text(s["number"] if s["enabled"] else "·", 12, bold=True),
+                                        width=39,
+                                        height=36,
+                                        alignment=ft.Alignment.CENTER,
+                                        border_radius=8,
+                                        bgcolor=CATEGORY_COLORS[s["category"]]
+                                        if s["enabled"]
+                                        else BG,
+                                        border=ft.Border.all(1, LINE),
+                                        tooltip=f"Ряд {s['row']}, место {s['number']} · {s['category']}"
+                                        + (
+                                            f" · {money(s['price_override'])}"
+                                            if s.get("price_override") is not None
+                                            else ""
+                                        ),
+                                        on_click=self.app.safe(lambda _, seat=s: click(seat)),
+                                    )
                                 )
                                 for s in sorted(items, key=lambda seat: seat["number"])
                             ],

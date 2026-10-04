@@ -55,6 +55,10 @@ class Service:
         self.logout()
         self.store.close()
 
+    def new_context(self) -> Service:
+        """Open an independent, unauthenticated session on this application's database."""
+        return Service(self.store.path.resolve(), seed=False)
+
     @staticmethod
     def _now() -> datetime:
         return datetime.now()
@@ -79,6 +83,14 @@ class Service:
     def _is_admin(self, db) -> bool:
         record = db.get(UserRecord, self._user_id) if self._user_id is not None else None
         return record is not None and record.role == "admin"
+
+    def _booking_actor(self, db) -> User:
+        actor = self._actor(db)
+        if actor.role == "admin":
+            raise AppError(
+                "Администратор управляет мероприятиями. Для бронирования войдите в аккаунт посетителя."
+            )
+        return actor
 
     @property
     def current_user(self) -> dict | None:
@@ -222,9 +234,40 @@ class Service:
             "min_price": min(prices, default=0),
         }
 
+    @staticmethod
+    def _filter_date(value) -> Date | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, Date):
+            return value
+        if isinstance(value, str):
+            try:
+                return Date.fromisoformat(value.strip())
+            except ValueError as exc:
+                raise AppError("Укажите дату в формате ГГГГ-ММ-ДД.") from exc
+        raise AppError("Укажите корректную дату.")
+
     def list_events(
-        self, search: str = "", category: str = "", date=None, admin: bool = False
+        self,
+        search: str = "",
+        category: str = "",
+        date=None,
+        admin: bool = False,
+        *,
+        date_from=None,
+        date_to=None,
     ) -> list[dict]:
+        selected_date = self._filter_date(date)
+        first, last = self._filter_date(date_from), self._filter_date(date_to)
+        if selected_date is not None:
+            if first is not None or last is not None:
+                raise AppError("Укажите одну дату или интервал дат.")
+            first = last = selected_date
+        if first is not None and last is not None and first > last:
+            raise AppError("Начало интервала не может быть позже его окончания.")
+        filtered_by_date = first is not None or last is not None
         with self.store.read() as db:
             if admin:
                 self._actor(db, admin=True)
@@ -246,15 +289,14 @@ class Service:
                         )
                     )
                 )
-                if date:
-                    selected_date = date.date() if isinstance(date, datetime) else date
-                    if isinstance(selected_date, str):
-                        try:
-                            selected_date = Date.fromisoformat(selected_date)
-                        except ValueError as exc:
-                            raise AppError("Укажите дату в формате ГГГГ-ММ-ДД.") from exc
-                    sessions = [item for item in sessions if item.start.date() == selected_date]
-                if (not admin or date) and not sessions:
+                if filtered_by_date:
+                    sessions = [
+                        item
+                        for item in sessions
+                        if (first is None or item.start.date() >= first)
+                        and (last is None or item.start.date() <= last)
+                    ]
+                if (not admin or filtered_by_date) and not sessions:
                     continue
                 result.append(self._event_dict(db, record, sessions))
             return sorted(result, key=lambda item: item["next_start"] or datetime.max)
@@ -262,6 +304,27 @@ class Service:
     def get_event(self, event_id: int) -> dict:
         with self.store.read() as db:
             return self._event_dict(db, self._event_record(db, event_id))
+
+    def get_related_event(self, event_id: int) -> dict:
+        """Read an event linked to the actor's cart or booking, including hidden events."""
+        with self.store.read() as db:
+            actor = self._actor(db)
+            in_cart = db.scalar(
+                select(CartItemRecord.id)
+                .join(SessionRecord, CartItemRecord.session_id == SessionRecord.id)
+                .where(CartItemRecord.user_id == actor.id, SessionRecord.event_id == event_id)
+                .limit(1)
+            )
+            in_history = db.scalar(
+                select(BookingRecord.id)
+                .join(SessionRecord, BookingRecord.session_id == SessionRecord.id)
+                .where(BookingRecord.user_id == actor.id, SessionRecord.event_id == event_id)
+                .limit(1)
+            )
+            if actor.role != "admin" and in_cart is None and in_history is None:
+                raise AppError("Мероприятие не связано с вашей корзиной или бронированиями.")
+            record = self._event_record(db, event_id, public=False)
+            return self._event_dict(db, record, [] if not record.published else None)
 
     def save_event(
         self, title, description, category, duration, published, cover_path="", event_id=None
@@ -536,6 +599,20 @@ class Service:
             old_hall_id = record.hall_id
             if session_id is not None:
                 self._session_domain(record).require_bookable(self._now())
+                if record.event_id != event_id and db.scalar(
+                    select(BookingRecord.id).where(BookingRecord.session_id == session_id).limit(1)
+                ):
+                    raise AppError(
+                        "У сеанса есть история бронирований. Для другого мероприятия создайте новый сеанс."
+                    )
+                if record.event_id != event_id and db.scalar(
+                    select(CartItemRecord.id)
+                    .where(CartItemRecord.session_id == session_id)
+                    .limit(1)
+                ):
+                    raise AppError(
+                        "Сеанс добавлен в корзины. Для другого мероприятия создайте новый сеанс."
+                    )
                 active_tickets = db.scalar(
                     select(func.count())
                     .select_from(TicketRecord)
@@ -741,7 +818,7 @@ class Service:
         if not seat_ids:
             raise AppError("Выберите хотя бы одно место.")
         with self.store.write() as db:
-            actor = self._actor(db)
+            actor = self._booking_actor(db)
             record = self._session_record(db, session_id)
             if not db.get(EventRecord, record.event_id).published:
                 raise AppError("Бронирование доступно только для опубликованных мероприятий.")
@@ -792,6 +869,7 @@ class Service:
                 result.append(
                     {
                         "id": item.id,
+                        "event_id": event.id,
                         "session_id": session.id,
                         "seat_id": item.seat_id,
                         "title": event.title,
@@ -821,7 +899,7 @@ class Service:
         changed = False
         result = []
         with self.store.write() as db:
-            actor = self._actor(db)
+            actor = self._booking_actor(db)
             previous = db.scalar(
                 select(CheckoutRequestRecord).where(
                     CheckoutRequestRecord.user_id == actor.id,
@@ -966,6 +1044,7 @@ class Service:
             "user_name": domain.owner.name,
             "user_login": domain.owner.login,
             "session_id": record.session_id,
+            "event_id": db.get(SessionRecord, record.session_id).event_id,
             "title": record.title,
             "start": record.start,
             "hall_name": record.hall_name,

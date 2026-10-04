@@ -23,8 +23,8 @@ def main(page: ft.Page):
         page.title = "EventSeat — ошибка открытия базы"
         page.add(ft.Text("Не удалось открыть EventSeat", size=26), ft.Text(str(error)))
         return
-    page.on_disconnect = lambda _: service.close()
     app = App(page, service)
+    page.on_disconnect = lambda _: app.close()
     app.start()
     if verification_folder is not None:
         if len(os.environ.get("EVENTSEAT_QA_PASSWORD", "")) < 12:
