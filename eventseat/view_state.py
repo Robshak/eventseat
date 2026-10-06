@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 
@@ -15,14 +16,73 @@ class AccountViewState:
 
     @property
     def admin_route(self):
-        return self.routes.get(
+        route = self.routes.get(
             "Администрирование",
             {"section": "Администрирование", "page": "list", "tab": "Мероприятия"},
-        ).copy()
+        )
+        return deepcopy(route)
 
     @staticmethod
     def route_key(route):
-        return json.dumps(route, sort_keys=True, ensure_ascii=False, default=str)
+        destination = {key: value for key, value in route.items() if key != "return_to"}
+        return json.dumps(destination, sort_keys=True, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def same_destination(first, second):
+        keys = (
+            "section",
+            "page",
+            "tab",
+            "event_id",
+            "session_id",
+            "hall_id",
+            "booking_id",
+            "admin",
+        )
+        return all(first.get(key) == second.get(key) for key in keys)
+
+    @staticmethod
+    def filter_keys(route):
+        if route.get("page") == "catalogue":
+            return ("catalogue:fields", "catalogue:applied")
+        if route.get("page") == "bookings":
+            return ("bookings:filters",)
+        if route.get("section") == "Администрирование" and route.get("page") == "list":
+            if route.get("tab") == "Сеансы":
+                return ("admin:session_filters", "admin:session_applied")
+            if route.get("tab") == "Бронирования":
+                return ("admin:booking_filters", "admin:booking_applied")
+        return ()
+
+    @staticmethod
+    def return_label(route):
+        page = route.get("page")
+        if page in ("session_form", "session_detail"):
+            return "К редактированию сеанса" if route.get("session_id") else "К созданию сеанса"
+        if page == "event_form":
+            return (
+                "К редактированию мероприятия"
+                if route.get("event_id")
+                else "К созданию мероприятия"
+            )
+        if page == "list":
+            return {
+                "Мероприятия": "К мероприятиям",
+                "Сеансы": "К сеансам",
+                "Залы": "К залам",
+                "Бронирования": "К бронированиям",
+            }.get(route.get("tab"), "К администрированию")
+        return {
+            "hall": "К редактору зала",
+            "catalogue": "К афише",
+            "cart": "К корзине",
+            "bookings": "К бронированиям",
+            "event": "К мероприятию",
+            "session": "К сеансу",
+            "seats": "К схеме мест",
+            "booking_map": "К схеме билета",
+            "profile": "К профилю",
+        }.get(page, "Назад")
 
 
 class ViewStates:

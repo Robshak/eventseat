@@ -192,7 +192,10 @@ class DateInput(TextInput):
             error_max_lines=3,
             hint_text="ДД.ММ.ГГГГ",
             keyboard_type=ft.KeyboardType.DATETIME,
-            input_filter=ft.InputFilter(regex_string=r"[0-9./\-\s]", allow=True),
+            # Flet 1.0.3's CustomFilteringTextInputFormatter accepts the whole
+            # edit only when RegExp.hasMatch(newText), otherwise keeping the
+            # old value. The pattern must match empty text to allow clearing.
+            input_filter=ft.InputFilter(regex_string=r"^[0-9./\-\s]*$", allow=True),
             **kwargs,
         )
         self._app = app

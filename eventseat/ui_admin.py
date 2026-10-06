@@ -77,18 +77,34 @@ class AdminUI:
             "Залы": self.halls,
             "Бронирования": self.bookings,
         }[tab]
+        controls = render()
         self.app.show(
+            *(
+                [self.app.back_button("К мероприятиям", self.show)]
+                if self.app._route.get("return_to")
+                else []
+            ),
             self.app.heading(
                 "Администрирование", "Управляйте событиями, пространствами и бронированиями"
             ),
             self.tabs(tab),
-            *render(),
+            *controls,
         )
         if focus_session_id is not None:
             self.focus_session(focus_session_id)
 
     def focus_session(self, session_id):
         controls = self.app.content.controls
+        card = next(
+            (control for control in controls if str(control.key) == f"session-{session_id}"),
+            None,
+        )
+        if card is None:
+            return
+        card.bgcolor = "#E4F3F1"
+        card.border = ft.Border.all(2, TEAL)
+        hoverable(card, background="#F1F9F8")
+        self.page.update()
 
         async def reveal():
             await asyncio.sleep(0.12)
@@ -112,7 +128,11 @@ class AdminUI:
     def events(self):
         events = self.service.list_events(admin=True)
         controls = [
-            self.app.button("Создать мероприятие", lambda _: self.event_form(), icon=ft.Icons.ADD)
+            self.app.button(
+                "Создать мероприятие",
+                lambda _: self.app.open_related(self.event_form),
+                icon=ft.Icons.ADD,
+            )
         ]
         for event in events:
             card = panel(
@@ -132,23 +152,31 @@ class AdminUI:
                         ),
                         self.app.button(
                             "Создать сеанс",
-                            lambda _, eid=event["id"]: self.session_form(event_id=eid),
+                            lambda _, eid=event["id"]: self.app.open_related(
+                                lambda: self.session_form(event_id=eid)
+                            ),
                             secondary=True,
                         ),
                         self.app.button(
                             "Сеансы",
-                            lambda _, eid=event["id"]: self.show("Сеансы", event_id=eid),
+                            lambda _, eid=event["id"]: self.app.open_related(
+                                lambda: self.show("Сеансы", event_id=eid)
+                            ),
                             secondary=True,
                         ),
                         self.app.button(
                             "Изменить",
-                            lambda _, eid=event["id"]: self.event_form(eid),
+                            lambda _, eid=event["id"]: self.app.open_related(
+                                lambda: self.event_form(eid)
+                            ),
                             secondary=True,
                         ),
                     ]
                 ),
                 on_click=self.app.safe(
-                    lambda _, eid=event["id"]: self.show("Сеансы", event_id=eid)
+                    lambda _, eid=event["id"]: self.app.open_related(
+                        lambda: self.show("Сеансы", event_id=eid)
+                    )
                 ),
             )
             controls.append(hoverable(card, background="#F1F9F8"))
@@ -212,7 +240,7 @@ class AdminUI:
             )
             self.app.clear_capture()
             self.drafts.pop(draft_key, None)
-            self.show()
+            self.app.go_back(self.show)
             self.app.notice("Мероприятие опубликовано." if published else "Черновик сохранён.")
             return saved_id
 
@@ -225,9 +253,7 @@ class AdminUI:
             capture=capture,
         )
         self.app.show(
-            self.app.button(
-                "К мероприятиям", lambda _: self.show(), icon=ft.Icons.ARROW_BACK, secondary=True
-            ),
+            self.app.back_button("К мероприятиям", self.show),
             self.app.heading(
                 "Редактировать мероприятие" if event_id else "Новое мероприятие",
                 "Введённые данные сохраняются при переходах между разделами",
@@ -264,7 +290,9 @@ class AdminUI:
                         [
                             self.app.button(
                                 "Сеансы мероприятия",
-                                lambda _: self.show("Сеансы", event_id=event_id),
+                                lambda _: self.app.open_related(
+                                    lambda: self.show("Сеансы", event_id=event_id)
+                                ),
                                 secondary=True,
                             )
                         ]
@@ -339,8 +367,10 @@ class AdminUI:
                 [
                     self.app.button(
                         "Создать сеанс",
-                        lambda _: self.session_form(
-                            event_id=int(event.value) if event.value else None
+                        lambda _: self.app.open_related(
+                            lambda: self.session_form(
+                                event_id=int(event.value) if event.value else None
+                            )
                         ),
                         icon=ft.Icons.ADD,
                     ),
@@ -372,12 +402,16 @@ class AdminUI:
             actions = [
                 self.app.button(
                     "Заполненность и места",
-                    lambda _, sid=session["id"]: self.app.seats(sid, True),
+                    lambda _, sid=session["id"]: self.app.open_related(
+                        lambda: self.app.seats(sid, True)
+                    ),
                     secondary=True,
                 ),
                 self.app.button(
                     "К залу",
-                    lambda _, hid=session["hall_id"]: self.hall_form(hid),
+                    lambda _, hid=session["hall_id"]: self.app.open_related(
+                        lambda: self.hall_form(hid)
+                    ),
                     secondary=True,
                 ),
             ]
@@ -385,7 +419,9 @@ class AdminUI:
                 actions += [
                     self.app.button(
                         "Изменить",
-                        lambda _, sid=session["id"]: self.session_form(session_id=sid),
+                        lambda _, sid=session["id"]: self.app.open_related(
+                            lambda: self.session_form(session_id=sid)
+                        ),
                         secondary=True,
                     ),
                     self.app.button(
@@ -421,7 +457,11 @@ class AdminUI:
                 ),
                 ft.Row(actions, wrap=True),
                 key=ft.ScrollKey(f"session-{session['id']}"),
-                on_click=self.app.safe(lambda _, sid=session["id"]: self.session_form(sid)),
+                on_click=self.app.safe(
+                    lambda _, sid=session["id"]: self.app.open_related(
+                        lambda: self.session_form(sid)
+                    )
+                ),
             )
             if session["id"] == focus_session_id:
                 card.bgcolor = "#E4F3F1"
@@ -563,7 +603,14 @@ class AdminUI:
             )
             self.app.clear_capture()
             self.drafts.pop(draft_key, None)
-            self.show("Сеансы", focus_session_id=sid)
+            returning = bool(self.app._route.get("return_to"))
+            self.app.go_back(lambda: self.show("Сеансы", focus_session_id=sid))
+            if (
+                returning
+                and self.app._route.get("page") == "list"
+                and self.app._route.get("tab") == "Сеансы"
+            ):
+                self.focus_session(sid)
             self.app.notice("Сеанс сохранён.")
             return sid
 
@@ -577,9 +624,7 @@ class AdminUI:
             capture=capture if editable else None,
         )
         self.app.show(
-            self.app.button(
-                "К сеансам", lambda _: self.show("Сеансы"), icon=ft.Icons.ARROW_BACK, secondary=True
-            ),
+            self.app.back_button("К сеансам", lambda: self.show("Сеансы")),
             self.app.heading(
                 "Редактировать сеанс"
                 if session_id and editable
@@ -621,19 +666,25 @@ class AdminUI:
                     [
                         self.app.button(
                             "К мероприятию",
-                            lambda _: self.event_form(int(event_select.value)),
+                            lambda _: self.app.open_related(
+                                lambda: self.event_form(int(event_select.value))
+                            ),
                             secondary=True,
                         ),
                         self.app.button(
                             "К залу",
-                            lambda _: self.hall_form(int(hall_select.value)),
+                            lambda _: self.app.open_related(
+                                lambda: self.hall_form(int(hall_select.value))
+                            ),
                             secondary=True,
                         ),
                         *(
                             [
                                 self.app.button(
                                     "Заполненность и места",
-                                    lambda _: self.app.seats(session_id, True),
+                                    lambda _: self.app.open_related(
+                                        lambda: self.app.seats(session_id, True)
+                                    ),
                                     secondary=True,
                                 )
                             ]
@@ -649,7 +700,13 @@ class AdminUI:
 
     def halls(self):
         halls = self.service.list_halls()
-        controls = [self.app.button("Создать зал", lambda _: self.hall_form(), icon=ft.Icons.ADD)]
+        controls = [
+            self.app.button(
+                "Создать зал",
+                lambda _: self.app.open_related(self.hall_form),
+                icon=ft.Icons.ADD,
+            )
+        ]
         for hall in halls:
             controls.append(
                 panel(
@@ -671,12 +728,16 @@ class AdminUI:
                             ),
                             self.app.button(
                                 "Сеансы зала",
-                                lambda _, hid=hall["id"]: self.show("Сеансы", hall_id=hid),
+                                lambda _, hid=hall["id"]: self.app.open_related(
+                                    lambda: self.show("Сеансы", hall_id=hid)
+                                ),
                                 secondary=True,
                             ),
                             self.app.button(
                                 "Редактировать схему",
-                                lambda _, hid=hall["id"]: self.hall_form(hid),
+                                lambda _, hid=hall["id"]: self.app.open_related(
+                                    lambda: self.hall_form(hid)
+                                ),
                                 secondary=True,
                             ),
                         ]
@@ -698,7 +759,7 @@ class AdminUI:
         def save(_):
             hall_id = self.service.copy_hall(hall["id"], name.value)
             self.page.pop_dialog()
-            self.hall_form(hall_id)
+            self.app.open_related(lambda: self.hall_form(hall_id))
 
         self.app.dialog(
             "Скопировать зал",
@@ -914,15 +975,21 @@ class AdminUI:
                 "Электронный билет", lambda _: self.app.ticket(booking["id"]), secondary=True
             ),
             self.app.button(
-                "Места на схеме", lambda _: self.app.booking_map(booking["id"]), secondary=True
+                "Места на схеме",
+                lambda _: self.app.open_related(lambda: self.app.booking_map(booking["id"])),
+                secondary=True,
             ),
             self.app.button(
-                "К сеансу", lambda _: self.session_form(booking["session_id"]), secondary=True
+                "К сеансу",
+                lambda _: self.app.open_related(lambda: self.session_form(booking["session_id"])),
+                secondary=True,
             ),
             self.app.button(
                 "К мероприятию",
-                lambda _: self.app.event_detail(
-                    booking["event_id"], related=True, back=("К бронированиям", return_to_list)
+                lambda _: self.app.open_related(
+                    lambda: self.app.event_detail(
+                        booking["event_id"], related=True, back=("К бронированиям", return_to_list)
+                    )
                 ),
                 secondary=True,
             ),

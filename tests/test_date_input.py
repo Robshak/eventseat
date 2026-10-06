@@ -1,4 +1,5 @@
 import asyncio
+import re
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -106,6 +107,50 @@ class DateApp:
 
     def safe(self, callback):
         return callback
+
+
+def client_filtered_edit(field, previous, proposed):
+    """Model the pinned Flet client contract, before any Python change callback.
+
+    v1.0.3 packages/flet/lib/src/utils/textfield.dart:37-45 returns newValue
+    when RegExp.hasMatch(newValue.text), otherwise oldValue. It does not call
+    Flutter's standard allow/deny filtering implementation. This deliberately
+    uses search, not fullmatch: our shared ASCII character-class regex must
+    itself permit empty input and reject mixed invalid content.
+    """
+    return proposed if re.search(field.input_filter.regex_string, proposed) else previous
+
+
+@pytest.mark.parametrize("initial", ["0", "8", "08.10.2026"])
+def test_client_filter_permits_complete_deletion_before_change_callback(initial):
+    field = DateInput(DateApp(), "Дата", initial)
+    assert client_filtered_edit(field, initial, "") == ""
+
+
+@pytest.mark.parametrize(
+    "proposed", ["0", "08.", "08.10.2026", "08102026", "08/10/2026", "2026-10-08", " 08102026 "]
+)
+def test_client_filter_preserves_supported_partial_dates_and_paste_formats(proposed):
+    field = DateInput(DateApp(), "Дата")
+    assert client_filtered_edit(field, "", proposed) == proposed
+
+
+@pytest.mark.parametrize("proposed", ["x", "8a", "08.10.2026x", "!08.10.2026"])
+def test_client_filter_rejects_mixed_invalid_characters(proposed):
+    field = DateInput(DateApp(), "Дата", "0")
+    assert client_filtered_edit(field, "0", proposed) == "0"
+
+
+def test_client_filter_and_mask_backspace_through_every_character_to_empty():
+    field = DateInput(DateApp(), "Дата", "08.10.2026")
+    value = field.value
+    while value:
+        proposed = value[:-1]
+        accepted = client_filtered_edit(field, value, proposed)
+        edited = format_date_edit(value, accepted, (len(proposed),) * 2, (len(value),) * 2)
+        assert len(edited.value) < len(value)
+        value = edited.value
+    assert value == ""
 
 
 def walk(control):

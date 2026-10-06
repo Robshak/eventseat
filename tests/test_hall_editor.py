@@ -23,6 +23,14 @@ class EditorApp:
     def button(self, label, action, **kwargs):
         return ft.Button(label, on_click=action)
 
+    def back_button(self, label, action):
+        return self.button(label, lambda _: self.go_back(action))
+
+    def go_back(self, fallback):
+        if getattr(self, "on_view_outside_click", None):
+            self.on_view_outside_click()
+        return fallback()
+
     def heading(self, title, subtitle):
         return ft.Text(title)
 
@@ -175,7 +183,7 @@ def test_noninteractive_background_regions_use_basic_cursor_and_back_clears_befo
     editor.show()
     for region, surface in [
         (editor.background_region, editor.background),
-        (editor.grid_region, editor.grid_panel),
+        (editor.panel_region, editor.grid_panel),
         (editor.inspector_region, editor.inspector),
     ]:
         assert region.mouse_cursor == ft.MouseCursor.BASIC
@@ -185,8 +193,61 @@ def test_noninteractive_background_regions_use_basic_cursor_and_back_clears_befo
     editor.selection.anchor = 0
     seen = []
     admin.show = lambda tab: seen.append((tab, set(editor.selection.selected)))
-    editor.back_to_halls()
+    back = editor.background.content.controls[0]
+    assert back.content == "К залам"
+    back.on_click(None)
     assert seen == [("Залы", set())]
+
+
+def test_only_actual_seat_matrix_is_protected_inside_the_white_panel():
+    admin = make_admin()
+    editor = HallEditor(admin, 7)
+    editor.show()
+    editor.selection.selected = {0, 1}
+    editor.selection.anchor = 0
+    editor.draw()
+    editor.draw_inspector()
+    assert editor.grid_region.content is editor.grid
+    assert editor.grid_region in editor.grid_panel.content.controls
+    assert editor.panel_region.content is editor.grid_panel
+    assert editor.workspace.controls[0] is editor.panel_region
+    # Small halls leave white space to the right; that space must belong to the
+    # clearing panel rather than the protected seat matrix.
+    assert editor.grid_region.width < editor.grid_panel.width - 50
+    actual_width = max(
+        sum(control.width for control in row.controls) + row.spacing * (len(row.controls) - 1)
+        for row in editor.grid.controls
+    )
+    assert editor.grid_region.width == pytest.approx(actual_width)
+    editor.grid_region.on_tap(None)
+    assert editor.selection.selected == {0, 1}
+    editor.panel_region.on_tap(None)
+    assert editor.selection.selected == set()
+    assert not editor.inspector.visible
+
+
+def test_panel_footer_stage_and_padding_are_outside_the_retaining_region():
+    admin = make_admin()
+    editor = HallEditor(admin, 7)
+    editor.show()
+    protected_children = [
+        control
+        for control in editor.grid_panel.content.controls
+        if isinstance(control, ft.GestureDetector)
+    ]
+    assert protected_children == [editor.grid_region]
+    assert editor.summary in editor.grid_panel.content.controls
+    assert editor.selection_summary in editor.grid_panel.content.controls
+    assert editor.summary not in editor.grid.controls
+    assert editor.selection_summary not in editor.grid.controls
+    # Buttons keep their own action inside the clearing region; in Flutter the
+    # descendant tap recognizer wins over the parent's background recognizer.
+    action_row = editor.grid_panel.content.controls[-2]
+    select_all = next(button for button in action_row.controls if button.content == "Выделить всё")
+    select_all.on_click(None)
+    assert editor.selection.selected == set(range(len(editor.seats)))
+    editor.panel_region.on_tap(None)
+    assert not editor.selection.selected
 
 
 def test_resize_keeps_pending_properties_and_resizes_actual_cells():

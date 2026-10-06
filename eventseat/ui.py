@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import logging
 from collections import defaultdict
+from copy import deepcopy
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -151,6 +152,7 @@ class App:
         self._capture = None
         self._capture_user_id = None
         self._route = {}
+        self._navigation_context = None
         self.on_view_blur = None
         self.on_view_outside_click = None
         self.section = "Афиша"
@@ -185,6 +187,53 @@ class App:
         if self.on_view_outside_click:
             self.on_view_outside_click()
 
+    def open_related(self, action):
+        """Keep a serializable origin for a related page, including nested origins."""
+        self.capture_view()
+        route = deepcopy(self._route)
+        origin = {
+            "route": route,
+            "drafts": {
+                key: deepcopy(self.view_state.drafts.get(key))
+                for key in AccountViewState.filter_keys(route)
+            },
+            "scroll": self.view_state.scroll_offsets.get(AccountViewState.route_key(route), 0),
+        }
+        self.clear_capture()
+        previous = self._navigation_context
+        self._navigation_context = origin if route else {}
+        try:
+            return action()
+        finally:
+            self._navigation_context = previous
+
+    def back_button(self, default_label, default_action):
+        origin = self._route.get("return_to")
+        label = AccountViewState.return_label(origin["route"]) if origin else default_label
+        generation = self._view_generation
+
+        def back(_):
+            if generation == self._view_generation:
+                self.go_back(default_action)
+
+        return self.button(label, back, icon=ft.Icons.ARROW_BACK, secondary=True)
+
+    def go_back(self, fallback):
+        self.outside_view()
+        origin = deepcopy(self._route.get("return_to"))
+        if not origin:
+            return fallback()
+        self.capture_view()
+        self.clear_capture()
+        for key, value in origin["drafts"].items():
+            if value is None:
+                self.view_state.drafts.pop(key, None)
+            else:
+                self.view_state.drafts[key] = value
+        route = origin["route"]
+        self.view_state.scroll_offsets[AccountViewState.route_key(route)] = origin["scroll"]
+        return self.restore_route(route)
+
     def set_view(self, route, capture=None):
         self.capture_view()
         if self.on_view_blur:
@@ -194,12 +243,22 @@ class App:
         self._capture = capture
         self._capture_user_id = self.service.current_user["id"]
         self._view_generation += 1
-        self._route = dict(route)
+        route = deepcopy(route)
+        if self._navigation_context is not None:
+            origin = self._navigation_context
+            # A queued second click must not make the destination its own parent.
+            if origin and AccountViewState.same_destination(origin["route"], route):
+                origin = origin["route"].get("return_to")
+            if origin:
+                route["return_to"] = deepcopy(origin)
+        elif AccountViewState.same_destination(self._route, route) and self._route.get("return_to"):
+            route["return_to"] = deepcopy(self._route["return_to"])
+        self._route = route
         section = route["section"]
         changed_section = self.section != section
         self.section = section
         self.view_state.section = section
-        self.view_state.routes[section] = dict(route)
+        self.view_state.routes[section] = deepcopy(route)
         key = AccountViewState.route_key(route)
         state = self.view_state
         self.content.on_scroll = lambda event: state.scroll_offsets.__setitem__(
@@ -675,26 +734,57 @@ class App:
         self.activate_account()
 
     def restore_section(self, section):
-        route = self.view_state.routes.get(section, {})
-        if section == "Администрирование":
-            self.admin()
-        elif section == "Профиль":
-            self.profile()
-        elif section == "Корзина":
-            self.cart()
-        elif section == "Мои бронирования":
-            if route.get("page") == "booking_map":
-                self.booking_map(route["booking_id"])
-            else:
-                self.bookings()
-        elif route.get("page") == "seats":
-            self.seats(route["session_id"], route.get("admin", False))
-        elif route.get("page") == "event":
-            self.event_detail(route["event_id"], route.get("related", False))
-        elif route.get("page") == "session":
-            self.session_detail(route["session_id"], route.get("related", False))
-        else:
-            self.catalogue()
+        defaults = {
+            "Администрирование": {"page": "list", "tab": "Мероприятия"},
+            "Профиль": {"page": "profile"},
+            "Корзина": {"page": "cart"},
+            "Мои бронирования": {"page": "bookings"},
+            "Афиша": {"page": "catalogue"},
+        }
+        route = self.view_state.routes.get(section, {"section": section, **defaults[section]})
+        self.restore_route(route)
+
+    def restore_route(self, route):
+        """Rebuild a destination while retaining its own return path."""
+        from eventseat.ui_admin import AdminUI
+
+        route = deepcopy(route)
+        self.capture_view()
+        self.clear_capture()
+        previous = self._navigation_context
+        self._navigation_context = route.get("return_to", {})
+        page = route.get("page")
+        try:
+            if route.get("section") == "Администрирование":
+                admin = AdminUI(self)
+                if page == "hall":
+                    return admin.hall_form(route.get("hall_id"))
+                if page == "event_form":
+                    return admin.event_form(route.get("event_id"))
+                if page in ("session_form", "session_detail"):
+                    return admin.session_form(route.get("session_id"), route.get("event_id"))
+                if page == "seats":
+                    return self.seats(route["session_id"], True)
+                if page == "booking_map":
+                    return self.booking_map(route["booking_id"])
+                return admin.show(route.get("tab", "Мероприятия"), route.get("search", ""))
+            if page == "profile":
+                return self.profile()
+            if page == "cart":
+                return self.cart()
+            if page == "bookings":
+                return self.bookings(search=route.get("search", ""), period=route.get("tab"))
+            if page == "booking_map":
+                return self.booking_map(route["booking_id"])
+            if page == "seats":
+                return self.seats(route["session_id"], route.get("admin", False))
+            if page == "event":
+                return self.event_detail(route["event_id"], route.get("related", False))
+            if page == "session":
+                return self.session_detail(route["session_id"], route.get("related", False))
+            return self.catalogue()
+        finally:
+            self._navigation_context = previous
 
     def cover(self, cover_path, width=270, height=174):
         fallback = ft.Container(
@@ -830,12 +920,11 @@ class App:
                         border_radius=16,
                         border=ft.Border.all(1, LINE),
                         on_click=self.safe(
-                            lambda _, eid=event["id"]: self.event_detail(
-                                eid,
-                                back=(
-                                    "К афише",
-                                    self.catalogue,
-                                ),
+                            lambda _, eid=event["id"]: self.open_related(
+                                lambda: self.event_detail(
+                                    eid,
+                                    back=("К афише", self.catalogue),
+                                )
                             )
                         ),
                     ),
@@ -901,9 +990,7 @@ class App:
         preview = self.service.current_user["role"] == "admin"
         back_label, back_action = back or ("К афише", self.catalogue)
         controls = [
-            self.button(
-                back_label, lambda _: back_action(), icon=ft.Icons.ARROW_BACK, secondary=True
-            ),
+            self.back_button(back_label, back_action),
             ft.Row(
                 [
                     self.cover(event.get("cover_path", ""), 290, 210),
@@ -948,7 +1035,9 @@ class App:
                             text("от " + money(session.get("min_price") or 0), 17, bold=True),
                             self.button(
                                 "Посмотреть места" if preview else "Выбрать места",
-                                lambda _, sid=session["id"]: self.seats(sid),
+                                lambda _, sid=session["id"]: self.open_related(
+                                    lambda: self.seats(sid)
+                                ),
                                 disabled=not preview and session["free_count"] == 0,
                             ),
                         ]
@@ -1153,7 +1242,9 @@ class App:
                     ),
                     self.button(
                         "Управление сеансами",
-                        lambda _: self.admin("Сеансы", focus_session_id=session_id),
+                        lambda _: self.open_related(
+                            lambda: self.admin("Сеансы", focus_session_id=session_id)
+                        ),
                         secondary=True,
                     ),
                 ]
@@ -1175,11 +1266,9 @@ class App:
             col={"sm": 12, "lg": 4},
         )
         self.show(
-            self.button(
+            self.back_button(
                 "К сеансам" if admin else "К мероприятию",
-                lambda _: self.admin("Сеансы") if admin else self.event_detail(session["event_id"]),
-                icon=ft.Icons.ARROW_BACK,
-                secondary=True,
+                lambda: self.admin("Сеансы") if admin else self.event_detail(session["event_id"]),
             ),
             self.heading(
                 session["title"], f"{date_text(session['start'])} · {session['hall_name']}"
@@ -1250,8 +1339,10 @@ class App:
                     *rows,
                     self.button(
                         "К мероприятию",
-                        lambda _, eid=first["event_id"]: self.event_detail(
-                            eid, related=True, back=("К корзине", self.cart)
+                        lambda _, eid=first["event_id"]: self.open_related(
+                            lambda: self.event_detail(
+                                eid, related=True, back=("К корзине", self.cart)
+                            )
                         ),
                         icon=ft.Icons.ARROW_FORWARD,
                         secondary=True,
@@ -1386,10 +1477,12 @@ class App:
             actions = [
                 self.button(
                     "К мероприятию",
-                    lambda _, eid=booking["event_id"]: self.event_detail(
-                        eid,
-                        related=True,
-                        back=("К бронированиям", return_to_bookings),
+                    lambda _, eid=booking["event_id"]: self.open_related(
+                        lambda: self.event_detail(
+                            eid,
+                            related=True,
+                            back=("К бронированиям", return_to_bookings),
+                        )
                     ),
                     icon=ft.Icons.ARROW_FORWARD,
                     secondary=True,
@@ -1401,13 +1494,15 @@ class App:
                 ),
                 self.button(
                     "Места на схеме",
-                    lambda _, bid=booking["id"]: self.booking_map(bid),
+                    lambda _, bid=booking["id"]: self.open_related(lambda: self.booking_map(bid)),
                     icon=ft.Icons.EVENT_SEAT_OUTLINED,
                     secondary=True,
                 ),
                 self.button(
                     "К сеансу",
-                    lambda _, sid=booking["session_id"]: self.session_detail(sid, related=True),
+                    lambda _, sid=booking["session_id"]: self.open_related(
+                        lambda: self.session_detail(sid, related=True)
+                    ),
                     secondary=True,
                 ),
             ]
@@ -1480,7 +1575,11 @@ class App:
                 alignment=ft.Alignment.CENTER_LEFT,
                 padding=ft.Padding.symmetric(horizontal=4, vertical=8),
             ),
-            on_click=self.safe(lambda _: self.event_detail(event_id, related=True, back=back)),
+            on_click=self.safe(
+                lambda _: self.open_related(
+                    lambda: self.event_detail(event_id, related=True, back=back)
+                )
+            ),
         )
 
     def cancel_booking(self, booking_id, reason, admin):
@@ -1539,7 +1638,7 @@ class App:
 
     def open_ticket_target(self, action):
         self.page.pop_dialog()
-        action()
+        self.open_related(action)
 
     def readonly_map(self, layout, stage, selected_label="Места в билете"):
         rows = defaultdict(list)
@@ -1602,9 +1701,7 @@ class App:
             self.admin("Бронирования") if admin else self.bookings()
 
         controls = [
-            self.button(
-                "К бронированиям", lambda _: back(), icon=ft.Icons.ARROW_BACK, secondary=True
-            ),
+            self.back_button("К бронированиям", back),
             self.heading("Места по билету", f"{booking['number']} · {booking['title']}"),
             text(
                 f"{date_text(booking['start'])} · {booking['hall_name']} · сеанс #{booking['session_id']}",
@@ -1642,19 +1739,23 @@ class App:
                 [
                     self.button(
                         "К мероприятию",
-                        lambda _: self.event_detail(
-                            result["event_id"],
-                            related=True,
-                            back=("К схеме билета", lambda: self.booking_map(booking_id)),
+                        lambda _: self.open_related(
+                            lambda: self.event_detail(
+                                result["event_id"],
+                                related=True,
+                                back=("К схеме билета", lambda: self.booking_map(booking_id)),
+                            )
                         ),
                         secondary=True,
                     ),
                     self.button(
                         "К сеансу",
-                        lambda _: self.session_detail(
-                            result["session_id"],
-                            related=True,
-                            back=("К схеме билета", lambda: self.booking_map(booking_id)),
+                        lambda _: self.open_related(
+                            lambda: self.session_detail(
+                                result["session_id"],
+                                related=True,
+                                back=("К схеме билета", lambda: self.booking_map(booking_id)),
+                            )
                         ),
                         secondary=True,
                     ),
@@ -1690,9 +1791,7 @@ class App:
             else ("К мероприятию", lambda: self.event_detail(session["event_id"]))
         )
         controls = [
-            self.button(
-                back_label, lambda _: back_action(), secondary=True, icon=ft.Icons.ARROW_BACK
-            ),
+            self.back_button(back_label, back_action),
             self.heading(f"Сеанс #{session_id}", session["title"]),
             panel(
                 text(date_text(session["start"]), 24, bold=True),
@@ -1706,12 +1805,18 @@ class App:
             ),
             self.button(
                 "К мероприятию",
-                lambda _: self.event_detail(session["event_id"], related=related),
+                lambda _: self.open_related(
+                    lambda: self.event_detail(session["event_id"], related=related)
+                ),
                 secondary=True,
             ),
         ]
         if session.get("bookable", not cancelled and future) and session["free_count"]:
-            controls.append(self.button("Выбрать места", lambda _: self.seats(session_id)))
+            controls.append(
+                self.button(
+                    "Выбрать места", lambda _: self.open_related(lambda: self.seats(session_id))
+                )
+            )
         else:
             controls.append(text("Новые бронирования на этот сеанс недоступны.", color=MUTED))
         self.show(*controls)
@@ -1774,31 +1879,6 @@ class App:
         from eventseat.ui_admin import AdminUI
 
         self.capture_view()
-        admin = AdminUI(self)
         if tab is not None:
-            admin.show(tab, search, **kwargs)
-            return
-        route = self.view_state.admin_route
-        page = route.get("page", "list")
-        if page == "hall":
-            admin.hall_form(route.get("hall_id"))
-        elif page == "event_form":
-            admin.event_form(route.get("event_id"))
-        elif page == "session_form":
-            admin.session_form(route.get("session_id"), route.get("event_id"))
-        elif page == "session_detail":
-            admin.session_detail(route["session_id"])
-        elif page == "seats":
-            self.seats(route["session_id"], True)
-        elif page == "booking_map":
-            self.booking_map(route["booking_id"])
-        else:
-            admin.show(
-                route.get("tab", "Мероприятия"),
-                route.get("search", ""),
-                **{
-                    key: route[key]
-                    for key in ("event_id", "hall_id", "focus_session_id")
-                    if key in route
-                },
-            )
+            return AdminUI(self).show(tab, search, **kwargs)
+        return self.restore_route(self.view_state.admin_route)

@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import sqlite3
 import traceback
 from datetime import datetime, timedelta
@@ -77,8 +78,21 @@ async def verify(app, folder: Path, phase: str):
 
     async def wire_edit(label, value):
         target = next(c for c in controls() if isinstance(c, ft.TextField) and c.label == label)
+        input_filter = target.input_filter
+        if input_filter is not None:
+            # Model Flet 1.0.3's client-side hasMatch gate before its property
+            # patch/change event. This is a protocol/render check, not a keypress.
+            flags = (
+                (re.MULTILINE if input_filter.multiline else 0)
+                | (re.DOTALL if input_filter.dot_all else 0)
+                | (0 if input_filter.case_sensitive else re.IGNORECASE)
+            )
+            check(
+                re.search(input_filter.regex_string, value, flags) is not None,
+                f"Клиентский фильтр допускает новое значение поля: {label}",
+            )
         page.session.apply_patch(target._i, {"value": value})
-        await target._trigger_event("change", value)
+        await page.session.dispatch_event(target._i, "change", value)
         page.update()
         await asyncio.sleep(0.15)
         check(target.value == value, f"Протокол ввода сохраняет значение поля: {label}")
@@ -109,6 +123,14 @@ async def verify(app, folder: Path, phase: str):
         button = matches[0 if index is None else index]
         check(not button.disabled, f"Доступна кнопка: {label}")
         await invoke(button.on_click)
+
+    async def navigate(label):
+        item = next(
+            c
+            for c in app.nav.controls
+            if label in visible_texts(c) and callable(getattr(c, "on_click", None))
+        )
+        await invoke(item.on_click)
 
     async def booking_period(period):
         button = next(
@@ -257,6 +279,9 @@ async def verify(app, folder: Path, phase: str):
                 c for c in app.nav.controls if isinstance(c, ft.Container) and c.on_hover
             )
             await hover(nav_item, "пункт боковой навигации")
+            for value in ("0", "", "8", ""):
+                await wire_edit("С · ДД.ММ.ГГГГ", value)
+            await snapshot("date-input-cleared")
             for name in ("cinema.png", "concert.png", "lecture.png"):
                 check(asset_path(name).is_file(), f"Автономный ресурс: {name}")
             app.navigate("Администрирование", lambda: app.admin("Залы"))
@@ -297,6 +322,31 @@ async def verify(app, folder: Path, phase: str):
                 "Параметры кресла" in visible_texts(),
                 "Нажатие кресла открывает боковую панель параметров",
             )
+            for region, label in (
+                ("hall-grid-region", "сетки"),
+                ("hall-inspector-region", "инспектора"),
+            ):
+                target = next(c for c in controls() if c.data == region)
+                await invoke(target.on_tap)
+                check(
+                    "Выделено мест: 1" in visible_texts()
+                    and next(c for c in controls() if c.data == "hall-inspector-region").visible,
+                    f"Клик внутри {label} сохраняет выделенное кресло",
+                )
+            panel_region = next(c for c in controls() if c.data == "hall-grid-panel-region")
+            await invoke(panel_region.on_tap)
+            check(
+                "Выделено мест: 0" in visible_texts()
+                and not next(c for c in controls() if c.data == "hall-inspector-region").visible,
+                "Клик вне сетки внутри её панели снимает выделение и скрывает инспектор",
+            )
+            await snapshot("hall-panel-deselected")
+            cell = next(
+                c
+                for c in controls()
+                if isinstance(getattr(c, "data", None), dict) and c.data.get("hall_seat_index") == 0
+            )
+            await invoke(cell.on_click)
             await choose("Тип места", "aisle")
             await press("Применить к выделенным")
             dismiss()
@@ -460,6 +510,38 @@ async def verify(app, folder: Path, phase: str):
             await press("Создать сеанс")
             await choose("Мероприятие", event_id)
             await choose("Зал", hall_id)
+            fill("Дата · ДД.ММ.ГГГГ", "12.")
+            fill("Время · ЧЧ:ММ", "19:")
+            await press("К залу")
+            check(
+                bool(buttons("К созданию сеанса"))
+                and next(
+                    c
+                    for c in controls()
+                    if isinstance(c, ft.TextField) and c.label == "Название зала"
+                ).value
+                == "Зал сквозной проверки",
+                "Незавершённая форма создания сеанса открывает выбранный зал с контекстным возвратом",
+            )
+            await navigate("Профиль")
+            await navigate("Администрирование")
+            check(
+                bool(buttons("К созданию сеанса")),
+                "Возврат из профиля сохраняет путь от зала к созданию сеанса",
+            )
+            await snapshot("hall-from-session")
+            await press("К созданию сеанса")
+            restored = {
+                c.label: c.value for c in controls() if isinstance(c, (ft.TextField, ft.Dropdown))
+            }
+            check(
+                restored["Дата · ДД.ММ.ГГГГ"] == "12."
+                and restored["Время · ЧЧ:ММ"] == "19:"
+                and restored["Мероприятие"] == str(event_id)
+                and restored["Зал"] == str(hall_id),
+                "Контекстный возврат сохраняет незавершённые дату, время, мероприятие и зал",
+            )
+            await snapshot("session-draft-return")
             first_start = (datetime.now() + timedelta(days=10)).replace(
                 hour=19, minute=0, second=0, microsecond=0
             )
@@ -510,7 +592,12 @@ async def verify(app, folder: Path, phase: str):
                 == "Вечер в EventSeat",
                 "Из сеанса открыт редактор связанного мероприятия",
             )
-            app.session_detail(session_id)
+            await press("К редактированию сеанса")
+            check(
+                app._route.get("page") == "session_form"
+                and app._route.get("session_id") == session_id,
+                "Кнопка назад возвращает из мероприятия к редактированию конкретного сеанса",
+            )
             await press("К залу")
             check(
                 next(
@@ -521,7 +608,13 @@ async def verify(app, folder: Path, phase: str):
                 == "Зал сквозной проверки",
                 "Из сеанса открыт конструктор его зала",
             )
-            await press("К залам")
+            await press("К редактированию сеанса")
+            check(
+                app._route.get("page") == "session_form"
+                and app._route.get("session_id") == session_id,
+                "Кнопка назад возвращает из зала к редактированию конкретного сеанса",
+            )
+            app.admin("Залы")
             hall_card = next(
                 c
                 for c in descendants(app.content)
@@ -737,10 +830,21 @@ async def verify(app, folder: Path, phase: str):
                 "Выбор места и добавление в корзину через обработчики",
             )
             await snapshot("cart")
-            await press("К мероприятию")
+            event_link = next(
+                c
+                for c in controls()
+                if isinstance(c, ft.TextButton) and c.tooltip == "К мероприятию"
+            )
+            await invoke(event_link.on_click)
             check(
                 "Вечер в EventSeat" in visible_texts(app.content) and bool(buttons("К корзине")),
-                "Из корзины открыт экран мероприятия",
+                "Ссылка в заголовке корзины открывает мероприятие с контекстным возвратом",
+            )
+            await navigate("Профиль")
+            await navigate("Афиша")
+            check(
+                app._route.get("event_id") == event_id and bool(buttons("К корзине")),
+                "Возврат из профиля сохраняет мероприятие и путь обратно к корзине",
             )
             await press("К корзине")
             check(len(app.service.get_cart()) == 1, "Возврат к корзине сохраняет выбранные места")

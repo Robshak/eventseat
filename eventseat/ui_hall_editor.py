@@ -107,7 +107,7 @@ class HallEditor:
 
     @staticmethod
     def retain_selection(_=None):
-        """A local tap target keeps empty grid/inspector space out of the background target."""
+        """Only the seat matrix and inspector retain selection between their child controls."""
 
     def resize_layout(self):
         counts = defaultdict(int)
@@ -118,9 +118,12 @@ class HallEditor:
         )
         if hasattr(self, "grid_panel"):
             self.grid_panel.width = self.layout.panel_width
-            self.grid_region.width = self.layout.panel_width
+            self.panel_region.width = self.layout.panel_width
+            self.grid_region.width = self.layout.label_width + max(counts.values(), default=1) * (
+                self.layout.cell_width + self.layout.gap
+            )
             self.workspace.width = self.available_width
-            self.workspace.controls = [self.grid_region, self.inspector_region]
+            self.workspace.controls = [self.panel_region, self.inspector_region]
             self.header_title.width = max(240, min(480, self.available_width - 347))
 
     def show(self):
@@ -212,6 +215,12 @@ class HallEditor:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
             data="hall-header",
         )
+        self.grid_region = ft.GestureDetector(
+            self.grid,
+            mouse_cursor=ft.MouseCursor.BASIC,
+            on_tap=self.app.safe(self.retain_selection),
+            data="hall-grid-region",
+        )
         self.grid_panel = panel(
             self.summary,
             text(
@@ -225,7 +234,7 @@ class HallEditor:
                 bgcolor=BG,
                 alignment=ft.Alignment.CENTER,
             ),
-            self.grid,
+            self.grid_region,
             ft.Row([tag(c, INK, CATEGORY_COLORS[c]) for c in SEAT_CATEGORIES], wrap=True),
             ft.Row(
                 [
@@ -237,14 +246,14 @@ class HallEditor:
             self.selection_summary,
             data="hall-grid-panel",
         )
-        self.grid_region = ft.GestureDetector(
+        self.panel_region = ft.GestureDetector(
             self.grid_panel,
             mouse_cursor=ft.MouseCursor.BASIC,
-            on_tap=self.app.safe(self.retain_selection),
-            data="hall-grid-region",
+            on_tap=self.app.safe(self.clear_selection),
+            data="hall-grid-panel-region",
         )
         self.workspace = ft.Row(
-            [self.grid_region, self.inspector_region],
+            [self.panel_region, self.inspector_region],
             spacing=16,
             run_spacing=16,
             wrap=True,
@@ -255,12 +264,6 @@ class HallEditor:
         self.resize_layout()
         editor = ft.Column(
             [
-                self.app.button(
-                    "К залам",
-                    self.back_to_halls,
-                    icon=ft.Icons.ARROW_BACK,
-                    secondary=True,
-                ),
                 self.header,
                 panel(
                     ft.Row([self.fields["name"], self.fields["stage"]], wrap=True),
@@ -313,14 +316,12 @@ class HallEditor:
             {"section": "Администрирование", "page": "hall", "hall_id": self.hall_id},
             capture=self.capture,
         )
+        back = self.app.back_button("К залам", lambda: self.admin.show("Залы"))
+        editor.controls.insert(0, back)
         self.app.on_view_blur = self.clear_modifiers
         self.app.on_view_outside_click = self.clear_selection
         self.capture()
         self.app.show(self.listener)
-
-    def back_to_halls(self, _=None):
-        self.clear_selection()
-        self.admin.show("Залы")
 
     def draw(self):
         self.resize_layout()
@@ -568,5 +569,5 @@ class HallEditor:
         )
         self.app.clear_capture()
         self.app.view_state.drafts.pop(self.draft_key, None)
-        self.admin.show("Залы")
+        self.app.go_back(lambda: self.admin.show("Залы"))
         self.app.notice("Зал сохранён.")
