@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import json
 import os
+import sqlite3
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -74,6 +75,14 @@ async def verify(app, folder: Path, phase: str):
             raise AssertionError(f"Поле {label}: найдено {len(matches)}")
         matches[0].value = value
 
+    async def wire_edit(label, value):
+        target = next(c for c in controls() if isinstance(c, ft.TextField) and c.label == label)
+        page.session.apply_patch(target._i, {"value": value})
+        await target._trigger_event("change", value)
+        page.update()
+        await asyncio.sleep(0.15)
+        check(target.value == value, f"Протокол ввода сохраняет значение поля: {label}")
+
     async def choose(label, value):
         if label == "Аккаунты":
             selector = next(c for c in controls() if getattr(c, "data", None) == "account-switcher")
@@ -99,6 +108,14 @@ async def verify(app, folder: Path, phase: str):
             raise AssertionError(f"Кнопка {label}: найдено {len(matches)}")
         button = matches[0 if index is None else index]
         check(not button.disabled, f"Доступна кнопка: {label}")
+        await invoke(button.on_click)
+
+    async def booking_period(period):
+        button = next(
+            c
+            for c in controls()
+            if isinstance(getattr(c, "data", None), dict) and c.data.get("booking_period") == period
+        )
         await invoke(button.on_click)
 
     async def calendar(tooltip, day):
@@ -244,6 +261,14 @@ async def verify(app, folder: Path, phase: str):
                 check(asset_path(name).is_file(), f"Автономный ресурс: {name}")
             app.navigate("Администрирование", lambda: app.admin("Залы"))
             await press("Создать зал")
+            await wire_edit("Эконом, ₽", "0")
+            await wire_edit("Эконом, ₽", "")
+            check(
+                app.view_state.drafts["hall:new"]["prices"]["эконом"] == "",
+                "Очистка последнего символа сохраняется в черновике без подстановки нуля",
+            )
+            await snapshot("input-cleared")
+            await wire_edit("Эконом, ₽", "250")
             fill("Название зала", "Зал сквозной проверки")
             fill("Рядов", "3")
             fill("Мест в ряду", "6")
@@ -313,12 +338,20 @@ async def verify(app, folder: Path, phase: str):
                 ),
                 "В свойствах кресла нет индивидуальных цен",
             )
+            await press("Применить к выделенным")
+            dismiss()
             app.navigate("Профиль", app.profile)
             app.navigate("Администрирование", app.admin)
             check(
-                "Конструктор зала" in visible_texts() and "Выделено мест: 4" in visible_texts(),
-                "Возврат из профиля восстанавливает конструктор и выделенную группу",
+                "Конструктор зала" in visible_texts() and "Выделено мест: 0" in visible_texts(),
+                "Выход из рабочей области снимает выделение, возврат восстанавливает конструктор",
             )
+            restored_cell = next(
+                c
+                for c in controls()
+                if isinstance(getattr(c, "data", None), dict) and c.data.get("hall_seat_index") == 6
+            )
+            await invoke(restored_cell.on_click)
             check(
                 next(
                     c
@@ -326,11 +359,12 @@ async def verify(app, folder: Path, phase: str):
                     if isinstance(c, ft.Dropdown) and c.label == "Категория мест"
                 ).value
                 == "VIP",
-                "Несохранённые параметры группы сохраняются при навигации",
+                "Изменения кресел в черновике сохраняются при навигации",
             )
-            await press("Применить к выделенным")
-            dismiss()
             await snapshot("hall-editor")
+            background = next(c for c in controls() if c.data == "workspace-background")
+            await invoke(background.on_tap)
+            check("Выделено мест: 0" in visible_texts(), "Клик по фону снимает выделение кресла")
             await press("Предпросмотр")
             await snapshot("hall-preview", dialog=True)
             await press("Закрыть")
@@ -353,6 +387,37 @@ async def verify(app, folder: Path, phase: str):
                 "Категория применена ко всей группе, индивидуальных цен нет",
             )
             await snapshot("admin-halls")
+            await press("Создать зал")
+            fill("Рядов", "3")
+            fill("Мест в ряду", "50")
+            await press("Построить сетку")
+            await press("Подтвердить")
+            wide_panel = next(c for c in controls() if c.data == "hall-grid-panel")
+            wide_cells = [
+                c
+                for c in controls()
+                if isinstance(getattr(c, "data", None), dict) and "hall_seat_index" in c.data
+            ]
+            check(
+                len(wide_cells) == 150
+                and wide_panel.width <= 900
+                and all(c.width < 39 for c in wide_cells),
+                "Широкая сетка уменьшает кресла и укладывается в максимальную ширину",
+            )
+            header = next(c for c in controls() if c.data == "hall-header")
+            check(
+                {"Предпросмотр", "Сохранить зал"}
+                <= {
+                    c.content
+                    for c in descendants(header)
+                    if isinstance(getattr(c, "content", None), str)
+                },
+                "Предпросмотр и сохранение находятся в заголовке редактора",
+            )
+            await app.content.scroll_to(offset=300, duration=0)
+            await snapshot("hall-wide-grid")
+            await press("К залам")
+            app.view_state.drafts.pop("hall:new", None)
             app.admin("Мероприятия")
             await press("Создать мероприятие")
             fill("Название", "Вечер в EventSeat")
@@ -590,8 +655,8 @@ async def verify(app, folder: Path, phase: str):
                 app.account_menu.popup.visible
                 and app.account_menu.popup.bottom
                 > app.account_menu.FOOTER_HEIGHT + account_selector.height
-                and app.account_menu.popup.left + app.account_menu.popup.width <= 238,
-                "Меню раскрывается вверх и остаётся внутри боковой панели",
+                and app.account_menu.popup.width > account_selector.width,
+                "Меню раскрывается вверх и выходит за ширину боковой панели",
             )
             await snapshot("account-menu-open")
             await invoke(app.account_menu.listener.on_key_down, SimpleNamespace(key="Escape"))
@@ -704,7 +769,14 @@ async def verify(app, folder: Path, phase: str):
                 and not app.service.list_bookings(),
                 "Переключение и устаревший обработчик не меняют корзину и брони пользователя",
             )
+            await invoke(app.account_menu.trigger.on_click)
+            check(
+                app.account_menu.popup.width > app.account_menu.trigger.width
+                and all(item.tooltip is None for item in app.account_menu.items),
+                "Меню аккаунтов шире кнопки и не показывает лишние подсказки",
+            )
             await snapshot("account-switcher")
+            app.account_menu.close()
             await choose("Аккаунты", admin_id)
             app.navigate("Профиль", app.profile)
             await press("Выйти из аккаунта")
@@ -722,6 +794,12 @@ async def verify(app, folder: Path, phase: str):
                 "Подтверждение бронирования и очистка корзины",
             )
             await snapshot("bookings")
+            await booking_period("past")
+            check(
+                "Нет прошедших бронирований" in visible_texts(),
+                "Пустая история понятна пользователю",
+            )
+            await booking_period("upcoming")
             await press("К мероприятию")
             check(
                 "Вечер в EventSeat" in visible_texts(app.content)
@@ -804,6 +882,36 @@ async def verify(app, folder: Path, phase: str):
                 "Показатели соответствуют отфильтрованному списку бронирований",
             )
             await snapshot("combined-bookings")
+            original_controls = list(app.content.controls)
+            booking_card = next(
+                c
+                for c in controls()
+                if isinstance(getattr(c, "data", None), dict)
+                and c.data.get("booking_id") == booking["id"]
+            )
+            measured = {}
+
+            def measure_card(event):
+                measured.update(width=event.width, height=event.height)
+
+            app.show(ft.Container(booking_card, on_size_change=measure_card))
+            await asyncio.sleep(0.5)
+            check(
+                150 < measured.get("height", 0) < 600,
+                "Карточка бронирования имеет компактную реальную высоту без серого блока",
+            )
+            report["booking_card_size"] = measured.copy()
+            await snapshot("booking-card-full")
+            measured.clear()
+            app.show(ft.Container(booking_card, width=480, on_size_change=measure_card))
+            await asyncio.sleep(0.5)
+            check(
+                150 < measured.get("height", 0) < 700 and measured.get("width", 0) <= 480,
+                "Карточка в узкой области переносит строки и кнопки без лишней высоты",
+            )
+            report["narrow_booking_card_size"] = measured.copy()
+            await snapshot("booking-card-narrow")
+            app.show(*original_controls)
             fill("Поиск по номеру, имени или логину", "несуществующее бронирование")
             await press("Применить фильтры")
             check(
@@ -901,6 +1009,30 @@ async def verify(app, folder: Path, phase: str):
                 "Карта отменённого билета сохраняет историческое выделение мест",
             )
             await snapshot("cancelled-ticket-map")
+            dismiss()
+            app.bookings()
+            check(
+                bool(buttons("Предстоящие · 1")),
+                "Отменённая будущая бронь остаётся в предстоящих",
+            )
+            # Time travel affects only the isolated --verify-ui database.
+            past = (datetime.now() - timedelta(days=1)).isoformat(sep=" ")
+            with sqlite3.connect(app.service.store.path) as connection:
+                connection.execute(
+                    "UPDATE bookings SET start = ? WHERE id = ?", (past, booking["id"])
+                )
+            app.bookings()
+            check(
+                bool(buttons("Предстоящие · 0")) and bool(buttons("Прошедшие · 1")),
+                "Бронь переходит в историю исключительно по времени сеанса",
+            )
+            await booking_period("past")
+            await snapshot("past-bookings")
+            app.navigate("Профиль", app.profile)
+            app.navigate("Мои бронирования", lambda: app.restore_section("Мои бронирования"))
+            check(
+                app._route["tab"] == "past", "Вкладка истории сохраняется после перехода в профиль"
+            )
         report["success"] = True
     except Exception:
         report["error"] = traceback.format_exc()

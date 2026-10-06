@@ -2,7 +2,9 @@ import flet as ft
 
 
 class AccountMenu:
-    WIDTH = 190
+    WIDTH = 320
+    TRIGGER_WIDTH = 190
+    ITEM_HEIGHT = 74
     TRIGGER_HEIGHT = 66
     FOOTER_HEIGHT = 98
 
@@ -33,7 +35,7 @@ class AccountMenu:
                 spacing=5,
                 alignment=ft.MainAxisAlignment.CENTER,
             ),
-            width=self.WIDTH,
+            width=self.TRIGGER_WIDTH,
             height=self.TRIGGER_HEIGHT,
             tooltip="Переключить аккаунт",
             data="account-switcher",
@@ -70,26 +72,24 @@ class AccountMenu:
                                         size=13,
                                         color="#FFFFFF",
                                         weight=ft.FontWeight.W_600,
-                                        max_lines=2,
-                                        overflow=ft.TextOverflow.ELLIPSIS,
-                                    ),
-                                    ft.Text(
-                                        "@" + account["login"],
-                                        size=11,
-                                        color="#C7D8E4",
                                         max_lines=1,
                                         overflow=ft.TextOverflow.ELLIPSIS,
                                     ),
-                                    ft.Text(role, size=11, color="#C7D8E4"),
+                                    ft.Text(
+                                        f"@{account['login']} · {role}",
+                                        size=11,
+                                        color="#C7D8E4",
+                                        max_lines=2,
+                                        overflow=ft.TextOverflow.ELLIPSIS,
+                                    ),
                                 ],
                                 spacing=3,
                                 expand=True,
                             ),
                         ],
-                        spacing=8,
+                        spacing=12,
                     ),
-                    height=96,
-                    tooltip=f"{account['name']} · @{account['login']} · {role}",
+                    height=self.ITEM_HEIGHT,
                     data={"account_id": account["id"], "active": active},
                     on_click=app.safe(lambda _, uid=account["id"]: self.choose(uid)),
                     style=ft.ButtonStyle(
@@ -98,7 +98,7 @@ class AccountMenu:
                             ft.ControlState.HOVERED: "#35566D",
                             ft.ControlState.FOCUSED: "#35566D",
                         },
-                        padding=8,
+                        padding=12,
                         shape=ft.RoundedRectangleBorder(radius=8),
                         alignment=ft.Alignment.CENTER_LEFT,
                     ),
@@ -113,7 +113,7 @@ class AccountMenu:
             left=24,
             bottom=self.FOOTER_HEIGHT + self.TRIGGER_HEIGHT + 8,
             width=self.WIDTH,
-            height=min(312, len(self.items) * 100 + 8),
+            height=min(312, len(self.items) * (self.ITEM_HEIGHT + 4) + 10),
             padding=6,
             bgcolor="#142C43",
             border=ft.Border.all(1, "#66869D"),
@@ -121,18 +121,20 @@ class AccountMenu:
             visible=False,
             data="account-menu",
         )
-        self.backdrop = ft.Container(
+        self.backdrop = ft.GestureDetector(
+            ft.Container(bgcolor="#00000000", expand=True),
             left=0,
             top=0,
             right=0,
             bottom=0,
-            bgcolor="#00000000",
-            on_click=lambda _: self.close(),
+            mouse_cursor=ft.MouseCursor.BASIC,
+            on_tap=lambda _: self.close(),
             visible=False,
             data="account-menu-backdrop",
         )
 
     async def toggle(self, _=None):
+        self.app.outside_view()
         if self.opened:
             self.close()
             return

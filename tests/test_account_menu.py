@@ -17,6 +17,7 @@ def menu_for(count=2):
         page=SimpleNamespace(update=Mock(), run_task=Mock()),
         safe=lambda action: action,
         switch_account=Mock(),
+        outside_view=Mock(),
     )
     menu = AccountMenu(app, users[0])
     app.account_menu = menu
@@ -24,13 +25,16 @@ def menu_for(count=2):
     return app, menu
 
 
-def test_menu_opens_above_fixed_anchor_within_sidebar_and_closes_on_escape():
+def test_menu_opens_above_anchor_with_wider_account_cards_and_closes_on_escape():
     app, menu = menu_for()
     asyncio.run(menu.toggle())
     assert menu.popup.visible and menu.backdrop.visible
     assert menu.popup.bottom > menu.FOOTER_HEIGHT + menu.trigger.height
     assert menu.popup.left == 24
-    assert menu.popup.left + menu.popup.width <= 238 - 24
+    assert menu.popup.width > menu.trigger.width
+    assert menu.popup.left + menu.popup.width < 1000
+    assert all(item.tooltip is None for item in menu.items)
+    assert menu.items[0].height < 90
     assert menu.popup.height <= 720 - menu.popup.bottom - 24
     menu.listener.focus.assert_awaited_once()
     menu.key_down(SimpleNamespace(key="Escape"))
@@ -49,7 +53,7 @@ def test_many_accounts_scroll_inside_menu_and_only_selected_account_is_active():
 def test_outside_click_dismisses_without_switching_and_choice_closes_before_switch():
     app, menu = menu_for()
     asyncio.run(menu.toggle())
-    menu.backdrop.on_click(None)
+    menu.backdrop.on_tap(None)
     assert not menu.opened
     app.switch_account.assert_not_called()
     asyncio.run(menu.toggle())

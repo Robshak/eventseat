@@ -17,6 +17,7 @@ from eventseat.account_sessions import AccountSessions
 from eventseat.config import asset_path
 from eventseat.date_input import DateInput
 from eventseat.domain import AppError, PriceChanged
+from eventseat.text_input import TextInput
 from eventseat.view_state import AccountViewState, ViewStates
 
 BG = "#F4F6F8"
@@ -63,7 +64,7 @@ def text(value, size=14, color=INK, bold=False, **kwargs):
 
 
 def field(label, value="", **kwargs):
-    return ft.TextField(
+    return TextInput(
         label=label,
         value=str(value),
         filled=True,
@@ -151,6 +152,7 @@ class App:
         self._capture_user_id = None
         self._route = {}
         self.on_view_blur = None
+        self.on_view_outside_click = None
         self.section = "Афиша"
         self.checkout_key = str(uuid4())
         self.busy_checkout = False
@@ -177,12 +179,18 @@ class App:
     def clear_capture(self):
         self._capture = None
         self._capture_user_id = None
+        self.on_view_outside_click = None
+
+    def outside_view(self, _=None):
+        if self.on_view_outside_click:
+            self.on_view_outside_click()
 
     def set_view(self, route, capture=None):
         self.capture_view()
         if self.on_view_blur:
             self.on_view_blur()
         self.on_view_blur = None
+        self.on_view_outside_click = None
         self._capture = capture
         self._capture_user_id = self.service.current_user["id"]
         self._view_generation += 1
@@ -581,7 +589,20 @@ class App:
             ft.Stack(
                 [
                     ft.Row(
-                        [sidebar, ft.Container(self.content, padding=30, expand=True)],
+                        [
+                            ft.GestureDetector(
+                                sidebar,
+                                mouse_cursor=ft.MouseCursor.BASIC,
+                                on_tap=self.safe(self.outside_view),
+                            ),
+                            ft.GestureDetector(
+                                ft.Container(self.content, padding=30, expand=True),
+                                expand=True,
+                                mouse_cursor=ft.MouseCursor.BASIC,
+                                on_tap=self.safe(self.outside_view),
+                                data="workspace-background",
+                            ),
+                        ],
                         spacing=0,
                         expand=True,
                         vertical_alignment=ft.CrossAxisAlignment.STRETCH,
@@ -595,6 +616,7 @@ class App:
         self.page.update()
 
     def navigate(self, label, action):
+        self.outside_view()
         self.capture_view()
         self.clear_capture()
         self.section = label
@@ -634,6 +656,7 @@ class App:
         self.restore_section(self.view_state.section)
 
     def add_account(self):
+        self.outside_view()
         self.capture_view()
         self.clear_capture()
         self.accounts.begin_login()
@@ -645,6 +668,7 @@ class App:
         self.activate_account()
 
     def switch_account(self, user_id):
+        self.outside_view()
         self.capture_view()
         self.clear_capture()
         self.accounts.switch(user_id)
@@ -1297,43 +1321,63 @@ class App:
         finally:
             self.busy_checkout = False
         self.checkout_key = str(uuid4())
-        self.navigate("Мои бронирования", self.bookings)
+        self.navigate("Мои бронирования", lambda: self.bookings(period="upcoming"))
         self.notice(f"Бронирование подтверждено. Оформлено заказов: {len(result)}.")
 
-    def bookings(self, admin=False, search=""):
+    def bookings(self, admin=False, search="", *, period=None):
         admin = admin or self.service.current_user["role"] == "admin"
         if admin:
             self.admin("Бронирования", search)
             return
+        period = period or self.view_state.drafts.get("bookings:filters", {}).get(
+            "period", "upcoming"
+        )
+        if period not in ("upcoming", "past"):
+            period = "upcoming"
         self.set_view(
             {
-                "section": "Администрирование" if admin else "Мои бронирования",
-                "page": "list" if admin else "bookings",
-                "tab": "Бронирования",
+                "section": "Мои бронирования",
+                "page": "bookings",
+                "tab": period,
                 "search": search,
             }
         )
-        bookings = self.service.list_bookings(search=search, admin=admin)
+        self.view_state.drafts["bookings:filters"] = {"period": period}
+        all_bookings = self.service.list_bookings(search=search)
+        now = datetime.now()
+        grouped = {
+            "upcoming": sorted(
+                (booking for booking in all_bookings if booking["start"] > now),
+                key=lambda booking: (booking["start"], booking["id"]),
+            ),
+            "past": sorted(
+                (booking for booking in all_bookings if booking["start"] <= now),
+                key=lambda booking: (booking["start"], booking["id"]),
+                reverse=True,
+            ),
+        }
+        bookings = grouped[period]
         controls = [
             self.heading(
-                "Все бронирования" if admin else "Мои бронирования",
+                "Мои бронирования",
                 "Электронные билеты и история посещений",
-            )
+            ),
+            ft.Row(
+                [
+                    self.button(
+                        f"{label} · {len(grouped[key])}",
+                        lambda _, selected=key: self.bookings(search=search, period=selected),
+                        secondary=period != key,
+                        data={"booking_period": key},
+                    )
+                    for key, label in (("upcoming", "Предстоящие"), ("past", "Прошедшие"))
+                ],
+                wrap=True,
+            ),
         ]
-        if admin:
-            query = field("Поиск по номеру, имени или логину", search, width=420)
-            query.on_submit = self.safe(lambda _: self.admin("Бронирования", query.value))
-            controls.append(
-                ft.Row(
-                    [query, self.button("Найти", lambda _: self.admin("Бронирования", query.value))]
-                )
-            )
 
         def return_to_bookings():
-            if admin:
-                self.admin("Бронирования", search)
-            else:
-                self.bookings(False, search)
+            self.bookings(search=search, period=period)
 
         for booking in bookings:
             status = {"active": "Активно", "cancelled": "Отменено", "completed": "Завершено"}[
@@ -1406,18 +1450,25 @@ class App:
                             for ticket in booking["tickets"]
                         )
                     ),
-                    *([text("Владелец: " + booking["user_name"], color=MUTED)] if admin else []),
                     *(
                         [text("Причина отмены: " + booking["cancel_reason"], color=RED)]
                         if booking.get("cancel_reason")
                         else []
                     ),
                     ft.Row(actions, wrap=True),
+                    data={"booking_id": booking["id"]},
                 )
             )
         if not bookings:
             controls.append(
-                self.empty("Бронирований пока нет", "Ваши подтверждённые билеты появятся здесь.")
+                self.empty(
+                    "Нет предстоящих бронирований"
+                    if period == "upcoming"
+                    else "Нет прошедших бронирований",
+                    "Билеты на будущие сеансы появятся здесь."
+                    if period == "upcoming"
+                    else "Здесь будут бронирования сеансов, которые уже начались.",
+                )
             )
         self.show(*controls)
 

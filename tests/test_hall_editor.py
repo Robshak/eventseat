@@ -5,9 +5,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import flet as ft
+import pytest
 
 from eventseat.ui import field, rubles
-from eventseat.ui_hall_editor import HallEditor
+from eventseat.ui_hall_editor import HallEditor, fit_hall_grid
 
 
 class EditorApp:
@@ -131,3 +132,110 @@ def test_group_properties_are_applied_in_inspector_without_a_dialog():
     assert all(editor.seats[index]["enabled"] is False for index in {0, 1, 3, 4})
     assert all("price_override" not in seat for seat in editor.seats)
     assert editor.seats[2]["category"] == "стандарт"
+
+
+def test_outside_click_clears_selection_but_keeps_applied_draft():
+    admin = make_admin()
+    editor = HallEditor(admin, 7)
+    editor.show()
+    editor.selection.selected = {0, 1}
+    editor.selection.anchor = 0
+    editor.draw_inspector()
+    editor.property_fields["category"].value = "VIP"
+    editor.apply()
+    admin.app.on_view_outside_click()
+    assert not editor.selection.selected and editor.selection.anchor is None
+    assert not editor.inspector.visible
+    assert editor.seats[0]["category"] == editor.seats[1]["category"] == "VIP"
+    assert admin.app.view_state.drafts[editor.draft_key]["selected"] == []
+    assert editor.background.data == "hall-editor-background"
+    assert editor.background.on_click is None
+    assert editor.background_region.on_tap is not None
+
+
+def test_grid_and_inspector_background_clicks_preserve_pending_properties():
+    admin = make_admin()
+    editor = HallEditor(admin, 7)
+    editor.show()
+    editor.selection.selected = {0, 1}
+    editor.draw_inspector()
+    editor.property_fields["category"].value = "VIP"
+    editor.grid_region.on_tap(None)
+    editor.inspector_region.on_tap(None)
+    editor.property_fields["category"].on_focus(None)
+    assert editor.selection.selected == {0, 1}
+    assert editor.property_fields["category"].value == "VIP"
+    editor.fields["name"].on_focus(None)
+    assert not editor.selection.selected
+
+
+def test_noninteractive_background_regions_use_basic_cursor_and_back_clears_before_capture():
+    admin = make_admin()
+    editor = HallEditor(admin, 7)
+    editor.show()
+    for region, surface in [
+        (editor.background_region, editor.background),
+        (editor.grid_region, editor.grid_panel),
+        (editor.inspector_region, editor.inspector),
+    ]:
+        assert region.mouse_cursor == ft.MouseCursor.BASIC
+        assert surface.on_click is None
+        assert region.content is surface
+    editor.selection.selected = {0, 1}
+    editor.selection.anchor = 0
+    seen = []
+    admin.show = lambda tab: seen.append((tab, set(editor.selection.selected)))
+    editor.back_to_halls()
+    assert seen == [("Залы", set())]
+
+
+def test_resize_keeps_pending_properties_and_resizes_actual_cells():
+    admin = make_admin()
+    editor = HallEditor(admin, 7)
+    editor.show()
+    editor.fields["rows"].value = "3"
+    editor.fields["columns"].value = "50"
+    editor.generate()
+    editor.selection.selected = {0, 1}
+    editor.draw_inspector()
+    editor.property_fields["category"].value = "VIP"
+    editor.resize(SimpleNamespace(width=702))
+    assert editor.property_fields["category"].value == "VIP"
+    assert editor.layout.inspector_below is True
+    for row in editor.grid.controls:
+        rendered_width = sum(control.width for control in row.controls)
+        rendered_width += row.spacing * (len(row.controls) - 1)
+        assert rendered_width <= editor.grid_panel.width - 50 + 0.001
+    assert editor.grid_panel.width <= 702
+    assert all(cell.width < 39 for cell in editor.grid.controls[0].controls[1:])
+    assert editor.grid_panel.expand is None
+
+
+@pytest.mark.parametrize("columns", [1, 3, 10, 20, 50])
+@pytest.mark.parametrize("available", [680, 980, 1600])
+@pytest.mark.parametrize("inspector", [False, True])
+def test_layout_never_overflows_the_available_panel(columns, available, inspector):
+    layout = fit_hall_grid(columns, available, inspector)
+    assert 0 < layout.panel_width <= min(900, available)
+    assert (
+        layout.label_width + columns * (layout.cell_width + layout.gap)
+        <= layout.panel_width - 50 + 0.001
+    )
+    assert 0 < layout.cell_width <= 39
+    if inspector and not layout.inspector_below:
+        assert layout.panel_width + 280 + 16 <= available
+    elif inspector:
+        assert layout.panel_width + 280 + 16 > available
+
+
+def test_small_grid_stays_compact_and_actions_share_heading_row():
+    admin = make_admin()
+    editor = HallEditor(admin, 7)
+    editor.show()
+    editor.resize(SimpleNamespace(width=1400))
+    assert editor.grid_panel.width == 380
+    assert editor.header.controls == [editor.header_title, editor.header_actions]
+    assert [button.content for button in editor.header_actions.controls] == [
+        "Предпросмотр",
+        "Сохранить зал",
+    ]

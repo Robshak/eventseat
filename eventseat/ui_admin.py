@@ -951,10 +951,11 @@ class AdminUI:
                         "#F8E9E9" if booking["status"] == "cancelled" else "#E7F3F2",
                     ),
                     text(booking["number"], 13, MUTED, selectable=True),
-                    ft.Container(expand=True),
                     text(money(booking["total"]), 20, bold=True),
                 ],
                 wrap=True,
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                run_spacing=8,
             ),
             text(booking["title"], 22, bold=True),
             text(

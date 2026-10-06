@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from copy import deepcopy
+from dataclasses import dataclass
 
 import flet as ft
 
@@ -25,6 +26,36 @@ from eventseat.ui import (
 )
 
 
+@dataclass(frozen=True)
+class HallGridLayout:
+    panel_width: float
+    cell_width: float
+    cell_height: float
+    gap: float
+    label_width: float
+    inspector_below: bool
+
+
+def fit_hall_grid(columns, available_width, inspector_visible=False):
+    """Fit the actual cells, including borders/padding, without horizontal overflow."""
+    columns = max(1, columns)
+    available = max(1, float(available_width))
+    minimum, maximum, panel_inset, label = 380, 900, 50, 54
+    inline = max(1, available - (296 if inspector_visible else 0))
+    natural = panel_inset + label + columns * 45
+    inline_panel = min(max(minimum, natural), maximum, inline)
+    inline_cell = max(0, inline_panel - panel_inset - label) / columns * 39 / 45
+    full_panel = min(max(minimum, natural), maximum, available)
+    below = inspector_visible and (
+        inline < minimum or (inline_cell < 18 and full_panel > inline_panel + 60)
+    )
+    width = min(max(minimum, natural), maximum, available if below else inline)
+    # Narrow hosts can reduce the label gutter too; no fixed minimum may overflow.
+    label = min(label, max(0, (width - panel_inset) * 0.18))
+    scale = min(1.0, max(0.01, width - panel_inset - label) / (columns * 45))
+    return HallGridLayout(width, 39 * scale, 36 * scale, 6 * scale, label, below)
+
+
 class HallEditor:
     """A hall draft and its inspector; only plain values survive navigation."""
 
@@ -37,6 +68,7 @@ class HallEditor:
         self.draft_key = f"hall:{hall_id or 'new'}"
         self.pressed = set()
         self.property_fields = {}
+        self.available_width = 900.0
 
     def clear_modifiers(self, _=None):
         self.pressed.clear()
@@ -62,6 +94,34 @@ class HallEditor:
 
     def changed(self, _=None):
         self.capture()
+
+    def outside_field_focus(self, _=None):
+        self.clear_modifiers()
+        self.clear_selection()
+
+    def resize(self, event):
+        if event.width > 0 and abs(event.width - self.available_width) >= 1:
+            self.available_width = event.width
+            self.draw()
+            self.page.update()
+
+    @staticmethod
+    def retain_selection(_=None):
+        """A local tap target keeps empty grid/inspector space out of the background target."""
+
+    def resize_layout(self):
+        counts = defaultdict(int)
+        for seat in self.seats:
+            counts[seat["row"]] += 1
+        self.layout = fit_hall_grid(
+            max(counts.values(), default=1), self.available_width, bool(self.selection.selected)
+        )
+        if hasattr(self, "grid_panel"):
+            self.grid_panel.width = self.layout.panel_width
+            self.grid_region.width = self.layout.panel_width
+            self.workspace.width = self.available_width
+            self.workspace.controls = [self.grid_region, self.inspector_region]
+            self.header_title.width = max(240, min(480, self.available_width - 347))
 
     def show(self):
         self.app.capture_view()
@@ -94,7 +154,7 @@ class HallEditor:
             self.prices[category].value = value
         for control in [*self.fields.values(), *self.prices.values()]:
             control.on_change = self.app.safe(self.changed)
-            control.on_focus = self.app.safe(self.clear_modifiers)
+            control.on_focus = self.app.safe(self.outside_field_focus)
         self.seats = saved.get("seats", deepcopy(hall.get("seats", [])))
         for seat in self.seats:
             seat.pop("price_override", None)
@@ -105,10 +165,21 @@ class HallEditor:
             {index for index in saved.get("selected", []) if 0 <= index < len(self.seats)},
             saved.get("anchor"),
         )
-        self.grid = ft.Column(spacing=8)
+        self.grid = ft.Column(spacing=8, tight=True)
         self.summary = text("", color=MUTED)
         self.selection_summary = text("", size=13, color=MUTED)
-        self.inspector = ft.Container(width=280, visible=bool(self.selection.selected))
+        self.inspector = ft.Container(
+            width=280,
+            visible=bool(self.selection.selected),
+            data="hall-inspector",
+        )
+        self.inspector_region = ft.GestureDetector(
+            self.inspector,
+            mouse_cursor=ft.MouseCursor.BASIC,
+            on_tap=self.app.safe(self.retain_selection),
+            visible=self.inspector.visible,
+            data="hall-inspector-region",
+        )
         self.stage_label = text(self.fields["stage"].value, 13, MUTED, True)
 
         def change_stage(_):
@@ -121,15 +192,76 @@ class HallEditor:
             self.generate(update=False)
         self.draw()
         self.draw_inspector(saved.get("properties"))
+        self.header_title = ft.Container(
+            self.app.heading("Конструктор зала", "Настройте кресла и проходы на схеме")
+        )
+        self.header_actions = ft.Row(
+            [
+                self.app.button("Предпросмотр", self.preview, secondary=True, width=155),
+                self.app.button("Сохранить зал", self.save, width=160),
+            ],
+            spacing=12,
+            tight=True,
+            data="hall-header-actions",
+        )
+        self.header = ft.Row(
+            [self.header_title, self.header_actions],
+            spacing=20,
+            wrap=True,
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            data="hall-header",
+        )
+        self.grid_panel = panel(
+            self.summary,
+            text(
+                "Клик — одно место · Shift + клик — прямоугольник · Ctrl + клик — добавить или убрать место",
+                12,
+                MUTED,
+            ),
+            ft.Container(
+                self.stage_label,
+                padding=15,
+                bgcolor=BG,
+                alignment=ft.Alignment.CENTER,
+            ),
+            self.grid,
+            ft.Row([tag(c, INK, CATEGORY_COLORS[c]) for c in SEAT_CATEGORIES], wrap=True),
+            ft.Row(
+                [
+                    self.app.button("Выделить всё", self.select_all, secondary=True),
+                    self.app.button("Снять выделение", self.clear_selection, secondary=True),
+                ],
+                wrap=True,
+            ),
+            self.selection_summary,
+            data="hall-grid-panel",
+        )
+        self.grid_region = ft.GestureDetector(
+            self.grid_panel,
+            mouse_cursor=ft.MouseCursor.BASIC,
+            on_tap=self.app.safe(self.retain_selection),
+            data="hall-grid-region",
+        )
+        self.workspace = ft.Row(
+            [self.grid_region, self.inspector_region],
+            spacing=16,
+            run_spacing=16,
+            wrap=True,
+            alignment=ft.MainAxisAlignment.START,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+            data="hall-workspace",
+        )
+        self.resize_layout()
         editor = ft.Column(
             [
                 self.app.button(
                     "К залам",
-                    lambda _: self.admin.show("Залы"),
+                    self.back_to_halls,
                     icon=ft.Icons.ARROW_BACK,
                     secondary=True,
                 ),
-                self.app.heading("Конструктор зала", "Настройте кресла и проходы на схеме"),
+                self.header,
                 panel(
                     ft.Row([self.fields["name"], self.fields["stage"]], wrap=True),
                     ft.Row(
@@ -147,53 +279,7 @@ class HallEditor:
                     text("Нумерация рядов и мест применяется при построении сетки.", 12, MUTED),
                     ft.Row(list(self.prices.values()), wrap=True),
                 ),
-                ft.Row(
-                    [
-                        panel(
-                            self.summary,
-                            text(
-                                "Клик — одно место · Shift + клик — прямоугольник между местами · Ctrl + клик — добавить или убрать место",
-                                12,
-                                MUTED,
-                            ),
-                            ft.Container(
-                                self.stage_label,
-                                padding=15,
-                                bgcolor=BG,
-                                alignment=ft.Alignment.CENTER,
-                            ),
-                            ft.Row([self.grid], scroll=ft.ScrollMode.ALWAYS),
-                            ft.Row(
-                                [tag(c, INK, CATEGORY_COLORS[c]) for c in SEAT_CATEGORIES],
-                                wrap=True,
-                            ),
-                            ft.Row(
-                                [
-                                    self.app.button(
-                                        "Выделить всё", self.select_all, secondary=True
-                                    ),
-                                    self.app.button(
-                                        "Снять выделение", self.clear_selection, secondary=True
-                                    ),
-                                ],
-                                wrap=True,
-                            ),
-                            self.selection_summary,
-                            expand=True,
-                        ),
-                        self.inspector,
-                    ],
-                    alignment=ft.MainAxisAlignment.START,
-                    vertical_alignment=ft.CrossAxisAlignment.START,
-                    spacing=16,
-                ),
-                ft.Row(
-                    [
-                        self.app.button("Предпросмотр", self.preview, secondary=True),
-                        self.app.button("Сохранить зал", self.save),
-                    ],
-                    wrap=True,
-                ),
+                self.workspace,
                 text(
                     "Черновик сохраняется при переходе между страницами до закрытия приложения. "
                     "Если зал уже используется сеансами, для новой структуры создайте копию. "
@@ -204,8 +290,21 @@ class HallEditor:
             ],
             spacing=20,
         )
-        self.listener = ft.KeyboardListener(
+        self.background = ft.Container(
             editor,
+            data="hall-editor-background",
+            on_size_change=self.app.safe(self.resize),
+            size_change_interval=50,
+            alignment=ft.Alignment.TOP_LEFT,
+        )
+        self.background_region = ft.GestureDetector(
+            self.background,
+            mouse_cursor=ft.MouseCursor.BASIC,
+            on_tap=self.app.safe(self.clear_selection),
+            data="hall-editor-background-region",
+        )
+        self.listener = ft.KeyboardListener(
+            self.background_region,
             autofocus=True,
             on_key_down=self.app.safe(self.key_down),
             on_key_up=self.app.safe(self.key_up),
@@ -215,10 +314,17 @@ class HallEditor:
             capture=self.capture,
         )
         self.app.on_view_blur = self.clear_modifiers
+        self.app.on_view_outside_click = self.clear_selection
         self.capture()
         self.app.show(self.listener)
 
+    def back_to_halls(self, _=None):
+        self.clear_selection()
+        self.admin.show("Залы")
+
     def draw(self):
+        self.resize_layout()
+        self.grid.spacing = self.layout.gap
         grouped = defaultdict(list)
         for index, seat in enumerate(self.seats):
             grouped[seat["row"]].append((index, seat))
@@ -232,20 +338,22 @@ class HallEditor:
                         ft.Container(
                             text(
                                 seat["number"] if seat["enabled"] else "·",
-                                12,
+                                min(12, self.layout.cell_width * 0.34),
                                 "#FFFFFF" if selected else INK,
                                 bold=True,
+                                max_lines=1,
+                                no_wrap=True,
                             ),
-                            width=39,
-                            height=36,
+                            width=self.layout.cell_width,
+                            height=self.layout.cell_height,
                             alignment=ft.Alignment.CENTER,
-                            border_radius=8,
+                            border_radius=min(8, self.layout.cell_width / 4),
                             bgcolor=TEAL
                             if selected
                             else CATEGORY_COLORS[seat["category"]]
                             if seat["enabled"]
                             else BG,
-                            border=ft.Border.all(2, TEAL if selected else LINE),
+                            border=ft.Border.all(1, TEAL if selected else LINE),
                             tooltip=f"Ряд {seat['row']}, место {seat['number']} · "
                             + (seat["category"] if seat["enabled"] else "проход")
                             + (" · выделено" if selected else ""),
@@ -255,7 +363,11 @@ class HallEditor:
                     )
                 )
             self.grid.controls.append(
-                ft.Row([text(f"Ряд {row}", 12, MUTED, width=60), *cells], spacing=6)
+                ft.Row(
+                    [text(f"Ряд {row}", 12, MUTED, width=self.layout.label_width), *cells],
+                    spacing=self.layout.gap,
+                    tight=True,
+                )
             )
         enabled = sum(bool(seat["enabled"]) for seat in self.seats)
         self.summary.value = f"Кресел: {enabled} · проходов: {len(self.seats) - enabled}"
@@ -280,6 +392,8 @@ class HallEditor:
         self.refresh_selection()
 
     def clear_selection(self, _=None):
+        if not self.selection.selected and self.selection.anchor is None:
+            return
         self.selection.clear()
         self.refresh_selection()
 
@@ -292,6 +406,7 @@ class HallEditor:
     def draw_inspector(self, restored=None):
         self.property_fields = {}
         self.inspector.visible = bool(self.selection.selected)
+        self.inspector_region.visible = self.inspector.visible
         if not self.selection.selected:
             self.inspector.content = None
             return
@@ -354,6 +469,7 @@ class HallEditor:
 
     def confirm_generate(self, _=None):
         self.clear_modifiers()
+        self.clear_selection()
         self.app.confirm(
             "Перестроить схему?",
             "Категории, номера кресел и проходы в текущем редакторе будут сброшены.",
@@ -389,6 +505,7 @@ class HallEditor:
 
     def preview(self, _=None):
         self.clear_modifiers()
+        self.clear_selection()
         prices = self.admin.read_prices(self.prices)
         grouped = defaultdict(list)
         for seat in self.seats:

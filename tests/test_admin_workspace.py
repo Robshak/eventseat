@@ -192,3 +192,44 @@ def test_ticket_map_return_preserves_combined_booking_filters(app_factory, syste
     assert app._route["tab"] == "Бронирования"
     assert app.view_state.drafts["admin:booking_applied"] == applied
     assert booking_ids(app) == {booking["id"]}
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_booking_card_keeps_long_details_and_actions_without_empty_flexible_space(
+    app_factory, system, cancelled
+):
+    user, session = system["user"], system["session"]
+    user.add_to_cart(session, seat_ids(user, session))
+    booking = user.checkout("long-booking-card")[0]
+    if cancelled:
+        user.cancel_booking(booking["id"])
+    app = app_factory("admin")
+    app.admin("Бронирования")
+    booking = app.service.list_bookings(admin=True)[0]
+    booking.update(
+        title="Большое музыкальное представление для всей семьи в вечернем формате",
+        user_name="Александр Константинович Константинопольский",
+        user_login="alexander_konstantinopolsky",
+        hall_name="Большой концертный зал имени Петра Ильича Чайковского",
+        total=123456789,
+    )
+    admin = AdminUI(app)
+    card = admin.booking_card(booking)
+    app.content.controls = [card]
+    texts = [str(c.value) for c in descendants(card) if isinstance(c, ft.Text)]
+    for expected in (
+        booking["number"],
+        money(booking["total"]),
+        booking["title"],
+        booking["user_name"],
+        booking["hall_name"],
+        "ряд 2, место 3",
+        "Отменено" if cancelled else "Активно",
+    ):
+        assert any(expected in value for value in texts)
+    assert ("Отменить" in button_labels(app)) is not cancelled
+    for row in (c for c in descendants(card) if isinstance(c, ft.Row) and c.wrap):
+        assert all(not getattr(c, "expand", False) for c in row.controls)
+    invoke(button(app, "К сеансу").on_click)
+    assert app._route["page"] == "session_form"
+    assert app._route["session_id"] == session

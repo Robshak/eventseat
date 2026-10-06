@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import flet as ft
 
 from eventseat.domain import AppError
+from eventseat.text_input import TextInput
 
 TEAL = "#087F8C"
 INK = "#182638"
@@ -158,7 +159,7 @@ def format_date_edit(
     return DateEdit(result, min(base, len(result)), min(extent, len(result)))
 
 
-class DateInput(ft.TextField):
+class DateInput(TextInput):
     """TextField-compatible date input. Use on_value_change instead of replacing on_change."""
 
     def __init__(
@@ -201,6 +202,7 @@ class DateInput(ft.TextField):
         self._previous_value = self.value
         self._last_selection = (len(self.value), len(self.value))
         self._previous_selection = self._last_selection
+        self._pending_selection = None
         self.on_value_change = on_change
         self.on_selection_change = app.safe(self._selection_changed)
         self.on_change = app.safe(self._changed)
@@ -216,6 +218,7 @@ class DateInput(ft.TextField):
         selected = event.selection
         self._previous_selection = self._last_selection
         self._last_selection = (selected.base_offset, selected.extent_offset)
+        self._pending_selection = self._last_selection
 
     async def _notify_value_change(self, event):
         if self.on_value_change:
@@ -226,7 +229,14 @@ class DateInput(ft.TextField):
     async def _changed(self, event):
         raw = event.data if isinstance(event.data, str) else self.value
         selected = self.selection
-        cursor = (selected.base_offset, selected.extent_offset) if selected else None
+        # Socket property patches can run ahead of queued event callbacks. An
+        # earlier edit may also rewrite self.selection while a later edit waits.
+        # Use the selection payload processed immediately before this change;
+        # fall back to the property for callers without a selection event.
+        cursor = self._pending_selection
+        self._pending_selection = None
+        if cursor is None:
+            cursor = (selected.base_offset, selected.extent_offset) if selected else None
         edited = format_date_edit(self._previous_value, raw, cursor, self._previous_selection)
         self.value = self._previous_value = edited.value
         self.selection = ft.TextSelection(edited.base, edited.extent)
